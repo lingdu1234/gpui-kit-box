@@ -2,7 +2,9 @@ use crate::app::app_content::AppContent;
 use crate::app::app_sidebar::AppSidebar;
 use crate::app::app_view_container::PageViewContainer;
 use crate::app::{AppConfigState, app_config_state::get_side_bar_side};
-use crate::app_pages::manual_page::ManualPage;
+use crate::app_pages::manual_page::{
+    ClassPage, FlowchartPage, FormulaPage, GanttPage, MarkdownBasicPage, SequencePage, StatePage,
+};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, h_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -73,11 +75,26 @@ pub struct AppView {
 
 impl AppView {
     pub fn new(_init_page: Option<&str>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 演示程序只有一页：其他业务页面全部去掉了。
-        let pages = vec![(
-            "文档",
-            vec![PageViewContainer::panel::<ManualPage>(window, cx)],
-        )];
+        // 演示程序只保留 Markdown 示例页：按图表类型拆开，方便逐类验证。
+        let pages = vec![
+            (
+                "文档",
+                vec![
+                    PageViewContainer::panel::<MarkdownBasicPage>(window, cx),
+                    PageViewContainer::panel::<FormulaPage>(window, cx),
+                ],
+            ),
+            (
+                "Mermaid 图表",
+                vec![
+                    PageViewContainer::panel::<FlowchartPage>(window, cx),
+                    PageViewContainer::panel::<SequencePage>(window, cx),
+                    PageViewContainer::panel::<ClassPage>(window, cx),
+                    PageViewContainer::panel::<StatePage>(window, cx),
+                    PageViewContainer::panel::<GanttPage>(window, cx),
+                ],
+            ),
+        ];
 
         let state = cx.new(|cx| {
             let (active_group_index, active_index, active_page) = get_first_page(&pages);

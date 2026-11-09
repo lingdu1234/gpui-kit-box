@@ -2,8 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! 演示程序：复用 LooTwo 的应用外壳（标题栏 / 侧边栏 / 页面容器），
-//! 但只保留一个 Markdown 文档页，用它展示 `gpui-kit-markdown-extras`
-//! 的公式与流程图渲染。
+//! 每个图表类型一个 Markdown 示例页，用它展示 `gpui-kit-markdown-extras`
+//! 的公式与流程图等图表渲染。
 
 mod app;
 mod app_pages;

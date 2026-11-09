@@ -14,3 +14,21 @@ categories = ["gui", "rendering", "parsing"]
 
 [dependencies]
 gpui-kit.workspace = true
+
+# 全部能力默认关闭，按图类型精确启用；未启用的 Mermaid 类型会安全回退成代码块。
+# 例：default-features = false, features = ["mermaid-sequence", "mermaid-gantt"]
+[features]
+default = []
+math = []
+mermaid = [
+    "mermaid-flowchart",
+    "mermaid-sequence",
+    "mermaid-class",
+    "mermaid-state",
+    "mermaid-gantt",
+]
+mermaid-flowchart = []
+mermaid-sequence = []
+mermaid-class = []
+mermaid-state = []
+mermaid-gantt = []

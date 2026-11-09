@@ -4,18 +4,18 @@
 
 `gpui-kit-box` is a **base framework / scaffold** for [gpui-kit](https://crates.io/crates/gpui-kit) programs, meant for quickly building desktop applications. It ships a reusable app shell: title bar, sidebar, page container, breadcrumb, plus theme and font-size switching and other common capabilities.
 
-In this repository, `gpui-kit-box` is used as a **demo program** — it keeps only a single Markdown doc page, used to validate the formula and Mermaid flowchart rendering from `gpui-kit-markdown-extras`.
+In this repository, `gpui-kit-box` is used as a **demo program** — split into one Markdown example page per diagram type, used to validate math and all five Mermaid diagram types from `gpui-kit-markdown-extras`.
 
 ## Features (the reusable shell)
 
 - **App shell**: title bar, sidebar, page container, breadcrumb — ready to use.
 - **Theme & font size**: light / dark theme switching, font-size selector.
 - **Locale**: `zh-CN`, default font `Microsoft YaHei`.
-- **Doc page (demo)**: the body is embedded at compile time via `include_str!` (`docs/showcase.md`), shipped with the binary (no disk reads); supports inline `$…$` / block `$$…$$` math and the `flowchart` subset inside ` ```mermaid ` fences.
+- **Doc pages (demo)**: one page per diagram type; the body is embedded at compile time via `include_str!` (`gpui-kit-markdown-extras/showcase/`), shipped with the binary (no disk reads); supports inline `$…$` / block `$$…$$` math and five diagram types inside ` ```mermaid ` fences: flowchart, sequenceDiagram, classDiagram, stateDiagram-v2 and gantt.
 
 ## Using it as a framework
 
-Start from this crate's app shell and swap in your own page content to quickly build a gpui-kit program. The rendering extras (math / flowcharts) come from the dependency crate `gpui-kit-markdown-extras`.
+Start from this crate's app shell and swap in your own page content to quickly build a gpui-kit program. The rendering extras (math / five diagram types) come from the dependency crate `gpui-kit-markdown-extras`; the demo explicitly enables its `math` and `mermaid` features in `Cargo.toml`.
 
 ## Run (the demo form in this repo)
 

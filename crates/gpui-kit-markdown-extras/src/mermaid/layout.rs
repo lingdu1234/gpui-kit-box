@@ -1,90 +1,28 @@
-//! Markdown 插件：Mermaid `flowchart` 渲染。
+//! 分层布局引擎：`flowchart` 与 `stateDiagram` 共用的「节点-连线」排版。
 //!
-//! 只支持手册实际用到的子集：`flowchart TD/TB` 的节点与箭头。
+//! 算法与原先单文件版本完全一致：最长路径分层（忽略 DFS 回边）→ 重心法减少
+//! 交叉 → 坐标修正推开重叠 → 跨层长边走左右侧通道。这里只把数据结构抽成公共
+//! 类型，让两类图能共用同一套布线，避免各自维护一份容易走样的布局器。
 //!
-//! ```text
-//! flowchart TD
-//!     A[启动软件] --> B{授权检查}
-//!     B -- 已激活 --> C[进入主界面]
-//!     B -->|首次| D[激活向导]
-//! ```
-//!
-//! 支持 `ID[文本]`、`ID{文本}`、`ID(文本)` 三种形状，`-->` / `-.->` / `==>` 三种箭头，
-//! 以及 `-->|文字|` 和 `-- 文字 -->` 两种边标注。解析不了的图（`sequenceDiagram`、
-//! `subgraph` 之类）直接返回 `None`，交给默认代码块渲染，不会吞内容。
-//!
-//! 排版思路：按最长路径分层（忽略回边），同层节点横排居中；正向边走「下-横-下」
-//! 折线，回边走右侧专用通道，箭头与折线用 `canvas` 画，节点与边标注用绝对定位的
-//! `div` 画——文字排版与居中直接复用 GPUI 的布局能力。
+//! 节点高度固定 [`NODE_H`]：复合状态这类「大框」由渲染层按成员包围盒额外描边，
+//! 不参与布局，因此状态图也能直接复用本引擎。
 
 use std::collections::HashMap;
 
-use gpui_kit::component::text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown_ast};
-use gpui_kit::component::{ActiveTheme as _, h_flex};
-use gpui_kit::{
-    AnyElement, App, IntoElement, ParentElement, PathBuilder, Pixels, Point, Styled, Window,
-    canvas, div, point, px,
-};
+use crate::estimate_width;
 
-use super::estimate_width;
-
-/// 关闭「已弃用 / 冗余写法」的告警没有意义，这里保持安静。
-pub struct MermaidPlugin;
-
-impl MarkdownPlugin for MermaidPlugin {
-    fn is_block(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "mermaid"
-    }
-
-    fn parse(
-        &self,
-        node: &markdown_ast::Node,
-        cx: &MarkdownParseContext<'_>,
-    ) -> Option<MarkdownNode> {
-        let markdown_ast::Node::Code(code) = node else {
-            return None;
-        };
-        let lang = code.lang.as_deref().unwrap_or_default();
-        if !lang.eq_ignore_ascii_case("mermaid") {
-            return None;
-        }
-        let graph = parse_graph(&code.value)?;
-        Some(
-            MarkdownNode::new("mermaid", graph)
-                .text(code.value.clone())
-                .markdown(cx.node_source(node).unwrap_or_default().to_string()),
-        )
-    }
-
-    fn render(&self, node: &MarkdownNode, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Some(graph) = node.data::<Graph>() else {
-            return div().into_any_element();
-        };
-        render_graph(graph, cx)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 图结构
-// ---------------------------------------------------------------------------
-
-const NODE_H: f32 = 40.;
-const H_GAP: f32 = 72.;
+pub(super) const NODE_H: f32 = 40.;
+pub(super) const H_GAP: f32 = 72.;
 /// 层间距的基数：每层之间至少留这么多高度，曲线与标签才不挤。
-const GAP_BASE: f32 = 84.;
-const PAD: f32 = 14.;
-const FONT: f32 = 13.;
+pub(super) const GAP_BASE: f32 = 84.;
+pub(super) const PAD: f32 = 14.;
+pub(super) const FONT: f32 = 13.;
 /// 侧通道宽度：跨层长边与回边从这里绕开中间的行。
-const LANE_W: f32 = 36.;
+pub(super) const LANE_W: f32 = 36.;
 /// 节点区与第一条侧通道之间再留一段空白，长线才会明显走在图的两侧。
-const LANE_MARGIN: f32 = 30.;
-const MIN_W: f32 = 140.;
-const MAX_W: f32 = 260.;
-
+pub(super) const LANE_MARGIN: f32 = 30.;
+pub(super) const MIN_W: f32 = 140.;
+pub(super) const MAX_W: f32 = 260.;
 /// 指向目标框底部的箭头（回退边从下方收进去）。
 fn arrow_up(tx: f32, ty: f32) -> [(f32, f32); 3] {
     [(tx - 5., ty + 10.), (tx + 5., ty + 10.), (tx, ty)]
@@ -94,213 +32,57 @@ fn arrow_up(tx: f32, ty: f32) -> [(f32, f32); 3] {
 fn arrow_down(tx: f32, ty: f32) -> [(f32, f32); 3] {
     [(tx - 5., ty - 10.), (tx + 5., ty - 10.), (tx, ty)]
 }
-
 #[derive(Clone, Copy, PartialEq)]
-enum Shape {
+pub(super) enum Shape {
     Rect,
     Round,
     Diamond,
+    /// 状态图 `[*]`：实心圆 + 外环。
+    #[cfg_attr(not(feature = "mermaid-state"), allow(dead_code))]
+    Terminal,
+    /// 状态图 `<<fork>>` / `<<join>>`：粗横条。
+    #[cfg_attr(not(feature = "mermaid-state"), allow(dead_code))]
+    Bar,
+}
+
+/// 复合状态的外框：按成员节点的包围盒在渲染层描边，不参与分层布局。
+#[derive(Clone)]
+pub(super) struct Overlay {
+    pub(super) label: String,
+    pub(super) members: Vec<usize>,
 }
 
 #[derive(Clone)]
-struct GraphNode {
-    label: String,
-    shape: Shape,
+pub(super) struct GraphNode {
+    pub(super) label: String,
+    pub(super) shape: Shape,
 }
 
 #[derive(Clone)]
-struct GraphEdge {
-    from: usize,
-    to: usize,
-    label: Option<String>,
+pub(super) struct GraphEdge {
+    pub(super) from: usize,
+    pub(super) to: usize,
+    pub(super) label: Option<String>,
     /// 指向已排在前面的层：画成右侧回边通道。
-    back: bool,
+    pub(super) back: bool,
 }
 
 #[derive(Clone)]
-struct Graph {
-    nodes: Vec<GraphNode>,
-    edges: Vec<GraphEdge>,
+pub(super) struct Graph {
+    pub(super) nodes: Vec<GraphNode>,
+    pub(super) edges: Vec<GraphEdge>,
+    /// 复合状态外框（flowchart 恒为空）。
+    pub(super) overlays: Vec<Overlay>,
+    /// 依附在某个节点右侧的说明文字：`(节点, 文本)`。
+    pub(super) notes: Vec<(usize, String)>,
 }
 
 // ---------------------------------------------------------------------------
-// 解析
+// 回边识别
 // ---------------------------------------------------------------------------
-
-fn parse_graph(source: &str) -> Option<Graph> {
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let mut edges: Vec<GraphEdge> = Vec::new();
-
-    for raw in source.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("%%") {
-            continue;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("flowchart")
-            || lower.starts_with("graph")
-            || lower.starts_with("subgraph")
-            || lower.starts_with("style")
-            || lower.starts_with("class")
-            || lower.starts_with("linkstyle")
-            || lower.starts_with("click")
-            || lower == "end"
-        {
-            continue;
-        }
-        for statement in line.split(';') {
-            let statement = statement.trim();
-            if !statement.is_empty() {
-                parse_statement(statement, &mut nodes, &mut index, &mut edges);
-            }
-        }
-    }
-
-    if nodes.is_empty() || edges.is_empty() {
-        return None;
-    }
-    mark_back_edges(&mut edges, nodes.len());
-    Some(Graph { nodes, edges })
-}
-
-fn parse_statement(
-    statement: &str,
-    nodes: &mut Vec<GraphNode>,
-    index: &mut HashMap<String, usize>,
-    edges: &mut Vec<GraphEdge>,
-) {
-    let mut chunks: Vec<String> = Vec::new();
-    let mut labels: Vec<Option<String>> = Vec::new();
-    let mut rest = statement;
-
-    while let Some((at, len)) = find_arrow(rest) {
-        let head = rest[..at].trim();
-        let mut tail = &rest[at + len..];
-        // `B -- 已激活 --> C`：标签写在箭头**前**，要从节点文本里切掉。
-        let (head, mut label) = split_trailing_label(head);
-        // `-->|文字|`：标签写在箭头**后**。
-        tail = tail.trim_start();
-        if let Some(after) = tail.strip_prefix('|')
-            && let Some(end) = after.find('|')
-        {
-            label = Some(clean_text(after[..end].trim()));
-            tail = &after[end + 1..];
-        }
-        chunks.push(head);
-        labels.push(label);
-        rest = tail;
-    }
-    chunks.push(rest.trim().to_string());
-
-    let mut previous: Option<usize> = None;
-    for (ix, chunk) in chunks.iter().enumerate() {
-        let Some((id, label, shape)) = parse_node(chunk) else {
-            previous = None;
-            continue;
-        };
-        let current = match index.get(&id) {
-            Some(&existing) => {
-                // 同一个节点后面再出现时，以第一次的文字为准（手册里写法一致）。
-                existing
-            }
-            None => {
-                nodes.push(GraphNode { label, shape });
-                index.insert(id, nodes.len() - 1);
-                nodes.len() - 1
-            }
-        };
-        if let Some(from) = previous {
-            edges.push(GraphEdge {
-                from,
-                to: current,
-                label: labels.get(ix - 1).cloned().flatten(),
-                back: false,
-            });
-        }
-        previous = Some(current);
-    }
-}
-
-/// 找出最早出现的箭头，返回 `(起始字节, 长度)`。
-fn find_arrow(text: &str) -> Option<(usize, usize)> {
-    const ARROWS: [&str; 6] = ["-.->", "==>", "-->", "-.-", "===", "---"];
-    let mut best: Option<(usize, usize)> = None;
-    for arrow in ARROWS {
-        if let Some(at) = text.find(arrow)
-            && best.is_none_or(|(best_at, _)| at < best_at)
-        {
-            best = Some((at, arrow.len()));
-        }
-    }
-    best
-}
-
-/// `B -- 已激活` → `("B", Some("已激活"))`：`--` 之后是边标签，不是节点文本。
-fn split_trailing_label(chunk: &str) -> (String, Option<String>) {
-    match chunk.rfind("--") {
-        Some(at) => {
-            let label = clean_text(chunk[at + 2..].trim());
-            (
-                chunk[..at].trim().to_string(),
-                (!label.is_empty()).then_some(label),
-            )
-        }
-        None => (chunk.trim().to_string(), None),
-    }
-}
-
-fn parse_node(chunk: &str) -> Option<(String, String, Shape)> {
-    let chunk = chunk.trim();
-    if chunk.is_empty() {
-        return None;
-    }
-    let open_at = chunk.find(['[', '{', '(']);
-    let (id, rest) = match open_at {
-        Some(at) => (&chunk[..at], &chunk[at..]),
-        None => (chunk, ""),
-    };
-    let id = clean_text(id.trim());
-    if id.is_empty() {
-        return None;
-    }
-    let mut label = id.clone();
-    let mut shape = Shape::Rect;
-    if !rest.is_empty() {
-        let (open, close, kind) = if rest.starts_with("((") {
-            ("((", "))", Shape::Round)
-        } else if rest.starts_with('(') {
-            ("(", ")", Shape::Round)
-        } else if rest.starts_with('{') {
-            ("{", "}", Shape::Diamond)
-        } else if rest.starts_with("[[") {
-            ("[[", "]]", Shape::Rect)
-        } else {
-            ("[", "]", Shape::Rect)
-        };
-        let inner = &rest[open.len()..];
-        let inner = inner.strip_suffix(close).unwrap_or(inner);
-        let text = clean_text(inner.trim());
-        if !text.is_empty() {
-            label = text;
-        }
-        shape = kind;
-    }
-    Some((id, label, shape))
-}
-
-/// 去掉引号与 `<br/>`，让标签能直接当纯文本画。
-fn clean_text(text: &str) -> String {
-    text.trim()
-        .trim_matches('"')
-        .replace("<br/>", " ")
-        .replace("<br>", " ")
-        .trim()
-        .to_string()
-}
 
 /// DFS 标出回边：指向「当前还在递归栈里」的节点的边。
-fn mark_back_edges(edges: &mut [GraphEdge], count: usize) {
+pub(super) fn mark_back_edges(edges: &mut [GraphEdge], count: usize) {
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); count];
     for (ix, edge) in edges.iter().enumerate() {
         adjacency[edge.from].push(ix);
@@ -337,24 +119,24 @@ fn mark_back_edges(edges: &mut [GraphEdge], count: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// 布局
+// 布局结果
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct Placed {
-    x: f32,
-    y: f32,
-    w: f32,
+pub(super) struct Placed {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) w: f32,
 }
 
-struct EdgeLine {
-    path: EdgePath,
-    head: [(f32, f32); 3],
-    label: Option<(f32, f32, String)>,
+pub(super) struct EdgeLine {
+    pub(super) path: EdgePath,
+    pub(super) head: [(f32, f32); 3],
+    pub(super) label: Option<(f32, f32, String)>,
 }
 
 #[derive(Clone, Debug)]
-enum EdgePath {
+pub(super) enum EdgePath {
     /// 相邻层：三次贝塞尔，从源框底部平滑弯到目标框顶部。
     Curve {
         p0: (f32, f32),
@@ -363,12 +145,15 @@ enum EdgePath {
         p3: (f32, f32),
     },
     /// 长边 / 回边：沿侧通道走的折线，拐角做圆角。
-    Elbow { points: Vec<(f32, f32)>, radius: f32 },
+    Elbow {
+        points: Vec<(f32, f32)>,
+        radius: f32,
+    },
 }
 
 impl EdgePath {
-    #[cfg(test)]
-    fn points(&self) -> Vec<(f32, f32)> {
+    #[cfg(all(test, feature = "mermaid-flowchart"))]
+    pub(super) fn points(&self) -> Vec<(f32, f32)> {
         match self {
             EdgePath::Curve { p0, c1, c2, p3 } => vec![*p0, *c1, *c2, *p3],
             EdgePath::Elbow { points, .. } => points.clone(),
@@ -376,25 +161,29 @@ impl EdgePath {
     }
 }
 
-struct Layout {
-    width: f32,
-    height: f32,
-    nodes: Vec<Placed>,
-    edges: Vec<EdgeLine>,
+pub(super) struct Layout {
+    pub(super) width: f32,
+    pub(super) height: f32,
+    pub(super) nodes: Vec<Placed>,
+    pub(super) edges: Vec<EdgeLine>,
     /// 判断框画成菱形，尺寸比文字框大一圈，单独记录给 canvas 画。
-    diamonds: Vec<Diamond>,
+    pub(super) diamonds: Vec<Diamond>,
     /// 每个节点所在的层，供测试判断一条边是否跨层。
     #[allow(dead_code)]
-    ranks: Vec<usize>,
+    pub(super) ranks: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
-struct Diamond {
-    cx: f32,
-    cy: f32,
-    hw: f32,
-    hh: f32,
+pub(super) struct Diamond {
+    pub(super) cx: f32,
+    pub(super) cy: f32,
+    pub(super) hw: f32,
+    pub(super) hh: f32,
 }
+
+// ---------------------------------------------------------------------------
+// 布局算法
+// ---------------------------------------------------------------------------
 
 /// 重心法的一趟：把每层节点按它在相邻层的邻居平均位置重排。
 fn barycenter_pass(
@@ -494,7 +283,7 @@ fn coordinate_pass(
 }
 
 /// 三次贝塞尔曲线上 `t` 处的点。
-fn cubic_point(
+pub(super) fn cubic_point(
     p0: (f32, f32),
     c1: (f32, f32),
     c2: (f32, f32),
@@ -542,8 +331,10 @@ fn blocked_between(
     for step in 0..=20 {
         let t = step as f32 / 20.;
         let mt = 1. - t;
-        let x = mt * mt * mt * sx + 3. * mt * mt * t * c1.0 + 3. * mt * t * t * c2.0 + t * t * t * tx;
-        let y = mt * mt * mt * sy + 3. * mt * mt * t * c1.1 + 3. * mt * t * t * c2.1 + t * t * t * ty;
+        let x =
+            mt * mt * mt * sx + 3. * mt * mt * t * c1.0 + 3. * mt * t * t * c2.0 + t * t * t * tx;
+        let y =
+            mt * mt * mt * sy + 3. * mt * mt * t * c1.1 + 3. * mt * t * t * c2.1 + t * t * t * ty;
         for (ix, node) in nodes.iter().enumerate() {
             if rank[ix] < lo || rank[ix] >= hi {
                 continue;
@@ -561,8 +352,7 @@ fn blocked_between(
     }
     false
 }
-
-fn layout(graph: &Graph) -> Layout {
+pub(super) fn layout(graph: &Graph) -> Layout {
     let count = graph.nodes.len();
 
     // 分层：只走非回边，最长路径。回边已经排除，所以不会死循环。
@@ -641,7 +431,11 @@ fn layout(graph: &Graph) -> Layout {
     by_rank_desc.sort_by_key(|&node| std::cmp::Reverse(rank[node]));
 
     for &node in &by_rank_desc {
-        let in_deg = graph.edges.iter().filter(|e| e.to == node && !e.back).count();
+        let in_deg = graph
+            .edges
+            .iter()
+            .filter(|e| e.to == node && !e.back)
+            .count();
         let outs: Vec<f32> = graph
             .edges
             .iter()
@@ -734,10 +528,8 @@ fn layout(graph: &Graph) -> Layout {
         let to_center = provisional[edge.to].x + provisional[edge.to].w / 2.;
         // 选边打分：目标那一侧空着（能从侧边收进去）记 2 分，源那一侧空着
         // （能从侧边出去）记 1 分，取分高的一侧；同分再看谁离得近。
-        let left_score =
-            free_left[edge.to] as i32 * 2 + free_left[edge.from] as i32;
-        let right_score =
-            free_right[edge.to] as i32 * 2 + free_right[edge.from] as i32;
+        let left_score = free_left[edge.to] as i32 * 2 + free_left[edge.from] as i32;
+        let right_score = free_right[edge.to] as i32 * 2 + free_right[edge.from] as i32;
         let left = match left_score.cmp(&right_score) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
@@ -789,9 +581,7 @@ fn layout(graph: &Graph) -> Layout {
     // 节点区整体右移，给左侧通道让位。
     let node_x0 = PAD + LANE_W * left_lanes as f32 + LANE_MARGIN;
     let lane_left = |index: usize| PAD + LANE_W * (index as f32 + 0.5);
-    let lane_right = |index: usize| {
-        node_x0 + max_row + LANE_MARGIN + LANE_W * (index as f32 + 0.5)
-    };
+    let lane_right = |index: usize| node_x0 + max_row + LANE_MARGIN + LANE_W * (index as f32 + 0.5);
     let width = node_x0 + max_row + LANE_MARGIN + LANE_W * right_lanes as f32 + PAD;
 
     let mut nodes = vec![
@@ -1134,577 +924,5 @@ fn layout(graph: &Graph) -> Layout {
         edges,
         diamonds,
         ranks: rank,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 渲染
-// ---------------------------------------------------------------------------
-
-/// 把折线画成圆角：拐角处用二次曲线过渡，观感和 Mermaid 的曲线接近。
-fn rounded_elbow<F>(
-    builder: &mut PathBuilder,
-    points: &[(f32, f32)],
-    radius: f32,
-    at: &F,
-) where
-    F: Fn(&(f32, f32)) -> Point<Pixels>,
-{
-    let Some(first) = points.first() else {
-        return;
-    };
-    builder.move_to(at(first));
-    for window in points.windows(3) {
-        let (prev, corner, next) = (window[0], window[1], window[2]);
-        let in_len = ((corner.0 - prev.0).powi(2) + (corner.1 - prev.1).powi(2)).sqrt();
-        let out_len = ((next.0 - corner.0).powi(2) + (next.1 - corner.1).powi(2)).sqrt();
-        let r = radius.min(in_len / 2.).min(out_len / 2.);
-        if r <= 0.5 {
-            builder.line_to(at(&corner));
-            continue;
-        }
-        let start = (
-            corner.0 + (prev.0 - corner.0) * r / in_len,
-            corner.1 + (prev.1 - corner.1) * r / in_len,
-        );
-        let end = (
-            corner.0 + (next.0 - corner.0) * r / out_len,
-            corner.1 + (next.1 - corner.1) * r / out_len,
-        );
-        builder.line_to(at(&start));
-        builder.curve_to(at(&end), at(&corner));
-    }
-    if let Some(last) = points.last() {
-        builder.line_to(at(last));
-    }
-}
-
-fn render_graph(graph: &Graph, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let (border, muted, line) = (theme.border, theme.muted, theme.muted_foreground);
-    let layout = layout(graph);
-
-    let mut paths: Vec<EdgePath> = Vec::new();
-    let mut heads: Vec<[(f32, f32); 3]> = Vec::new();
-    let mut labels: Vec<(f32, f32, String)> = Vec::new();
-    for edge in &layout.edges {
-        paths.push(edge.path.clone());
-        heads.push(edge.head);
-        if let Some(label) = &edge.label {
-            labels.push(label.clone());
-        }
-    }
-    let shapes = layout.diamonds.clone();
-
-    let paint = canvas(
-        move |bounds, _, _| bounds.origin,
-        move |_bounds, origin, window, _| {
-            // 布局算出来的是画布内坐标，而 `paint_path` 收的是窗口坐标，
-            // 必须加上画布自身的原点，否则所有线条都会跑到窗口左上角。
-            let (ox, oy) = (origin.x, origin.y);
-            let at = |p: &(f32, f32)| point(ox + px(p.0), oy + px(p.1));
-            for edge_path in &paths {
-                let mut builder = PathBuilder::stroke(px(1.2));
-                match edge_path {
-                    EdgePath::Curve { p0, c1, c2, p3 } => {
-                        builder.move_to(at(p0));
-                        builder.cubic_bezier_to(at(p3), at(c1), at(c2));
-                    }
-                    EdgePath::Elbow { points, radius } => {
-                        rounded_elbow(&mut builder, points, *radius, &at);
-                    }
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, line);
-                }
-            }
-            for head in &heads {
-                let mut builder = PathBuilder::fill();
-                builder.move_to(at(&(head[0].0, head[0].1)));
-                builder.line_to(at(&(head[1].0, head[1].1)));
-                builder.line_to(at(&(head[2].0, head[2].1)));
-                builder.close();
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, line);
-                }
-            }
-            // 菱形画在边之后：连线从框下方穿过时会被填充盖住。
-            for shape in &shapes {
-                let points = [
-                    (shape.cx, shape.cy - shape.hh),
-                    (shape.cx + shape.hw, shape.cy),
-                    (shape.cx, shape.cy + shape.hh),
-                    (shape.cx - shape.hw, shape.cy),
-                ];
-                let mut fill = PathBuilder::fill();
-                fill.move_to(at(&points[0]));
-                for p in &points[1..] {
-                    fill.line_to(at(p));
-                }
-                fill.close();
-                if let Ok(path) = fill.build() {
-                    window.paint_path(path, muted);
-                }
-                let mut stroke = PathBuilder::stroke(px(1.));
-                stroke.move_to(at(&points[0]));
-                for p in &points[1..] {
-                    stroke.line_to(at(p));
-                }
-                stroke.close();
-                if let Ok(path) = stroke.build() {
-                    window.paint_path(path, border);
-                }
-            }
-        },
-    )
-    .absolute()
-    .inset_0();
-
-    let mut container = div()
-        .relative()
-        .w(px(layout.width))
-        .h(px(layout.height))
-        .mx_auto()
-        .child(paint);
-
-    for (ix, node) in graph.nodes.iter().enumerate() {
-        let placed = &layout.nodes[ix];
-        if node.shape == Shape::Diamond {
-            // 菱形由 canvas 画（见上面的 shapes），这里只放居中的文字。
-            container = container.child(
-                div()
-                    .absolute()
-                    .left(px(placed.x))
-                    .top(px(placed.y))
-                    .w(px(placed.w))
-                    .h(px(NODE_H))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(FONT))
-                    .child(div().text_center().px_1().child(node.label.clone())),
-            );
-            continue;
-        }
-        let radius = match node.shape {
-            Shape::Round => px(18.),
-            _ => px(6.),
-        };
-        container = container.child(
-            div()
-                .absolute()
-                .left(px(placed.x))
-                .top(px(placed.y))
-                .w(px(placed.w))
-                .h(px(NODE_H))
-                .flex()
-                .items_center()
-                .justify_center()
-                .overflow_hidden()
-                .rounded(radius)
-                .border_1()
-                .border_color(border)
-                .bg(muted)
-                .text_size(px(FONT))
-                .child(div().text_center().px_2().child(node.label.clone())),
-        );
-    }
-
-    for (x, y, text) in labels {
-        let width = estimate_width(&text, 11.) + 10.;
-        // 贴边的通道标签不能探出画布。
-        let left = (x - width / 2.).clamp(0., (layout.width - width).max(0.));
-        container = container.child(
-            h_flex()
-                .absolute()
-                .left(px(left))
-                .top(px(y - 8.))
-                .px(px(3.))
-                .rounded(px(4.))
-                .bg(theme.background)
-                .text_size(px(11.))
-                .text_color(line)
-                .child(text),
-        );
-    }
-
-    container.into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 夹具里是使用手册中的 5 张图：插件必须能吃下的真实样本。
-    const GUIDE: &str = include_str!("../tests/fixtures/diagrams.md");
-    /// 展示页里的 3 张图（含三段回边的「发布流水线」），同样要做布局回归。
-    const SHOWCASE: &str = include_str!("../tests/fixtures/showcase.md");
-
-    fn mermaid_blocks(source: &str) -> Vec<String> {
-        let mut blocks = Vec::new();
-        let mut current: Option<String> = None;
-        for line in source.lines() {
-            let trimmed = line.trim_start();
-            if let Some(buffer) = current.as_mut() {
-                if trimmed.starts_with("```") {
-                    blocks.push(std::mem::take(buffer));
-                    current = None;
-                } else {
-                    buffer.push_str(line);
-                    buffer.push('\n');
-                }
-            } else if trimmed.starts_with("```mermaid") {
-                current = Some(String::new());
-            }
-        }
-        blocks
-    }
-
-    #[test]
-    fn parses_every_diagram_in_the_manual() {
-        let blocks = mermaid_blocks(GUIDE);
-        assert_eq!(blocks.len(), 5, "手册里的流程图数量变了，需要重新确认插件");
-
-        let mut saw_back_edge = false;
-        for (ix, block) in blocks.iter().enumerate() {
-            let graph = parse_graph(block).unwrap_or_else(|| panic!("第 {ix} 张图解析失败"));
-            assert!(graph.nodes.len() >= 3, "第 {ix} 张图节点太少");
-            assert!(graph.edges.len() >= 2, "第 {ix} 张图边太少");
-            for edge in &graph.edges {
-                assert!(edge.from < graph.nodes.len());
-                assert!(edge.to < graph.nodes.len());
-            }
-            saw_back_edge |= graph.edges.iter().any(|edge| edge.back);
-        }
-        assert!(saw_back_edge, "「生成 → 保存 → 自动重查」应被识别成回边");
-    }
-
-    #[test]
-    fn layout_keeps_nodes_inside_and_rows_apart() {
-        for block in mermaid_blocks(GUIDE) {
-            let graph = parse_graph(&block).expect("图应可解析");
-            let layout = layout(&graph);
-            assert!(layout.width > 0. && layout.height > 0.);
-
-            for placed in &layout.nodes {
-                assert!(placed.w > 0.);
-                assert!(placed.x >= 0. && placed.x + placed.w <= layout.width + 0.5);
-                assert!(placed.y >= 0. && placed.y + NODE_H <= layout.height + 0.5);
-            }
-            // 同一行不能横向重叠。
-            for (ix, a) in layout.nodes.iter().enumerate() {
-                for b in &layout.nodes[ix + 1..] {
-                    if (a.y - b.y).abs() < 0.5 {
-                        assert!(
-                            a.x + a.w <= b.x + 0.5 || b.x + b.w <= a.x + 0.5,
-                            "同一层的节点重叠了"
-                        );
-                    }
-                }
-            }
-            // 连线的控制点必须落在画布内。
-            for edge in &layout.edges {
-                for (x, y) in edge.path.points() {
-                    assert!(x >= 0. && x <= layout.width + 0.5);
-                    assert!(y >= 0. && y <= layout.height + 0.5);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn long_edges_do_not_cross_intermediate_rows() {
-        for block in mermaid_blocks(GUIDE) {
-            let graph = parse_graph(&block).expect("图应可解析");
-            let layout = layout(&graph);
-            let left = layout.nodes.iter().map(|node| node.x).fold(f32::MAX, f32::min);
-            let right = layout
-                .nodes
-                .iter()
-                .map(|node| node.x + node.w)
-                .fold(0., f32::max);
-
-            for (ix, edge) in graph.edges.iter().enumerate() {
-                match &layout.edges[ix].path {
-                    // 绕行的边必须真的绕到节点区外面。
-                    EdgePath::Elbow { points, .. } => assert!(
-                        points.iter().any(|(x, _)| *x < left || *x > right),
-                        "第 {ix} 条边绕了通道却没离开节点区"
-                    ),
-                    // 曲线自己采样，确认没压到中间那几层的节点。
-                    EdgePath::Curve { p0, c1, c2, p3 } => {
-                        let lo = layout.ranks[edge.from] + 1;
-                        let hi = layout.ranks[edge.to];
-                        for step in 0..=20 {
-                            let t = step as f32 / 20.;
-                            let mt = 1. - t;
-                            let x = mt * mt * mt * p0.0
-                                + 3. * mt * mt * t * c1.0
-                                + 3. * mt * t * t * c2.0
-                                + t * t * t * p3.0;
-                            let y = mt * mt * mt * p0.1
-                                + 3. * mt * mt * t * c1.1
-                                + 3. * mt * t * t * c2.1
-                                + t * t * t * p3.1;
-                            for (node_ix, node) in layout.nodes.iter().enumerate() {
-                                if layout.ranks[node_ix] < lo || layout.ranks[node_ix] >= hi {
-                                    continue;
-                                }
-                                assert!(
-                                    !(x > node.x + 1.
-                                        && x < node.x + node.w - 1.
-                                        && y > node.y + 1.
-                                        && y < node.y + NODE_H - 1.),
-                                    "第 {ix} 条曲线穿过了「{}」",
-                                    graph.nodes[node_ix].label
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn edges_leave_and_enter_independently() {
-        for block in mermaid_blocks(GUIDE) {
-            let graph = parse_graph(&block).expect("图应可解析");
-            let layout = layout(&graph);
-            let mut exits: std::collections::HashMap<usize, Vec<f32>> = Default::default();
-            let mut entries: std::collections::HashMap<usize, Vec<f32>> = Default::default();
-
-            for (ix, edge) in graph.edges.iter().enumerate() {
-                // 曲线的两端就是首尾控制点；折线的两端就是首尾折点。
-                // 不管走通道还是走曲线，同一个节点上的锚点都不允许重合。
-                let points = layout.edges[ix].path.points();
-                let start = points.first().expect("每条边都有起点");
-                let end = points.last().expect("每条边都有终点");
-                exits.entry(edge.from).or_default().push(start.0);
-                entries.entry(edge.to).or_default().push(end.0);
-            }
-
-            for (from, mut xs) in exits {
-                xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                for pair in xs.windows(2) {
-                    assert!(pair[1] - pair[0] > 1., "节点 {from} 的两条出线共用了同一个锚点");
-                }
-            }
-            for (to, mut xs) in entries {
-                xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                for pair in xs.windows(2) {
-                    assert!(pair[1] - pair[0] > 1., "节点 {to} 的两条入线共用了同一个锚点");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn single_child_ranks_align_under_their_parent() {
-        let blocks = mermaid_blocks(GUIDE);
-        let graph = parse_graph(&blocks[0]).expect("激活流程图应可解析");
-        let layout = layout(&graph);
-        let find = |label: &str| {
-            let ix = graph
-                .nodes
-                .iter()
-                .position(|node| node.label == label)
-                .unwrap_or_else(|| panic!("找不到节点 {label}"));
-            layout.nodes[ix]
-        };
-        let parent = find("激活向导");
-        let child = find("填注册码 + 授权账号密码");
-        let parent_center = parent.x + parent.w / 2.;
-        let child_center = child.x + child.w / 2.;
-        assert!(
-            (parent_center - child_center).abs() < 30.,
-            "子节点没落在父节点正下方：{parent_center} vs {child_center}"
-        );
-    }
-
-    #[test]
-    fn edge_labels_do_not_overlap() {
-        for block in mermaid_blocks(GUIDE) {
-            let graph = parse_graph(&block).expect("图应可解析");
-            let layout = layout(&graph);
-            // 标签在界面上是「估算宽 + 左右各 3px 内边距、高约 16px」的小块。
-            let rects: Vec<(&str, f32, f32, f32, f32)> = layout
-                .edges
-                .iter()
-                .filter_map(|edge| edge.label.as_ref())
-                .map(|(x, y, text)| {
-                    let w = estimate_width(text, 11.) + 6.;
-                    (text.as_str(), x - w / 2., y - 8., w, 16.)
-                })
-                .collect();
-            for (i, a) in rects.iter().enumerate() {
-                for b in rects.iter().skip(i + 1) {
-                    let hit_x = a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
-                    let hit_y = a.2 < b.2 + b.4 && b.2 < a.2 + a.4;
-                    assert!(
-                        !(hit_x && hit_y),
-                        "标签「{}」和「{}」叠在一起了: {:?} vs {:?}",
-                        a.0, b.0, a, b
-                    );
-                }
-            }
-        }
-    }
-
-    /// 把曲线采样成折线、折线保持折点，供「交叉 / 穿框」检测用。
-    fn sample_path(path: &EdgePath) -> Vec<(f32, f32)> {
-        match path {
-            EdgePath::Curve { p0, c1, c2, p3 } => (0..=24)
-                .map(|i| cubic_point(*p0, *c1, *c2, *p3, i as f32 / 24.))
-                .collect(),
-            EdgePath::Elbow { points, .. } => points.clone(),
-        }
-    }
-
-    /// 两条线段是否真交叉（共端点不算）。
-    fn segments_cross(a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32)) -> bool {
-        let o = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| {
-            (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
-        };
-        let (d1, d2, d3, d4) = (o(c, d, a), o(c, d, b), o(a, b, c), o(a, b, d));
-        (d1 > 0.) != (d2 > 0.) && (d3 > 0.) != (d4 > 0.)
-    }
-
-    /// 列出一张图里所有「边 × 边」交叉，返回可读的描述。
-    fn crossings(graph: &Graph, layout: &Layout) -> Vec<String> {
-        let paths: Vec<Vec<(f32, f32)>> = layout
-            .edges
-            .iter()
-            .map(|edge| sample_path(&edge.path))
-            .collect();
-        let mut hits = Vec::new();
-        for i in 0..paths.len() {
-            for j in i + 1..paths.len() {
-                let hit = paths[i].windows(2).any(|a| {
-                    paths[j]
-                        .windows(2)
-                        .any(|b| segments_cross(a[0], a[1], b[0], b[1]))
-                });
-                if hit {
-                    hits.push(format!(
-                        "{} → {}  ×  {} → {}",
-                        graph.nodes[graph.edges[i].from].label,
-                        graph.nodes[graph.edges[i].to].label,
-                        graph.nodes[graph.edges[j].from].label,
-                        graph.nodes[graph.edges[j].to].label
-                    ));
-                }
-            }
-        }
-        hits
-    }
-
-    fn assert_no_crossings(source: &str, name: &str) {
-        for (bi, block) in mermaid_blocks(source).iter().enumerate() {
-            let graph = parse_graph(block).unwrap_or_else(|| panic!("{name} 第 {bi} 张图解析失败"));
-            let layout = layout(&graph);
-            let hits = crossings(&graph, &layout);
-            assert!(
-                hits.is_empty(),
-                "{name} 第 {bi} 张图有 {} 处连线交叉:\n{}",
-                hits.len(),
-                hits.join("\n")
-            );
-        }
-    }
-
-    /// 连线是否从节点内部穿过；贴着边框出发 / 进入不算。
-    fn node_hits(graph: &Graph, layout: &Layout) -> Vec<String> {
-        let inside = |x: f32, y: f32, ix: usize| -> bool {
-            let node = layout.nodes[ix];
-            let cx = node.x + node.w / 2.;
-            let cy = node.y + NODE_H / 2.;
-            if graph.nodes[ix].shape == Shape::Diamond {
-                let hw = node.w / 2. + 22.;
-                let hh = NODE_H / 2. + 16.;
-                // 内缩 4px：斜边上的锚点正好在轮廓上，不该算穿框。
-                (x - cx).abs() / (hw - 4.) + (y - cy).abs() / (hh - 4.) < 1.
-            } else {
-                x > node.x + 3.
-                    && x < node.x + node.w - 3.
-                    && y > node.y + 3.
-                    && y < node.y + NODE_H - 3.
-            }
-        };
-        let mut hits = Vec::new();
-        for (ix, edge) in layout.edges.iter().enumerate() {
-            let points = sample_path(&edge.path);
-            for segment in points.windows(2) {
-                for step in 0..=10 {
-                    let t = step as f32 / 10.;
-                    let x = segment[0].0 + (segment[1].0 - segment[0].0) * t;
-                    let y = segment[0].1 + (segment[1].1 - segment[0].1) * t;
-                    for (ni, node) in graph.nodes.iter().enumerate() {
-                        if inside(x, y, ni) {
-                            hits.push(format!(
-                                "{} → {}  穿过了「{}」",
-                                graph.nodes[graph.edges[ix].from].label,
-                                graph.nodes[graph.edges[ix].to].label,
-                                node.label
-                            ));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        hits.sort();
-        hits.dedup();
-        hits
-    }
-
-    #[test]
-    fn fixture_edges_do_not_cross() {
-        assert_no_crossings(GUIDE, "使用手册夹具");
-    }
-
-    #[test]
-    fn showcase_edges_do_not_cross() {
-        assert_no_crossings(SHOWCASE, "展示页");
-    }
-
-    #[test]
-    fn edges_do_not_cross_nodes() {
-        for (name, source) in [("使用手册夹具", GUIDE), ("展示页", SHOWCASE)] {
-            for (bi, block) in mermaid_blocks(source).iter().enumerate() {
-                let graph = parse_graph(block).expect("图应可解析");
-                let layout = layout(&graph);
-                let hits = node_hits(&graph, &layout);
-                assert!(
-                    hits.is_empty(),
-                    "{name} 第 {bi} 张图有连线穿过节点:\n{}",
-                    hits.join("\n")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn parses_labels_and_shapes() {
-        let graph = parse_graph(
-            "flowchart TD\n\
-             A[启动软件] --> B{授权检查}\n\
-             B -- 已激活 --> C[进入主界面]\n\
-             B -->|首次| D(激活向导)\n\
-             C -.-> D\n",
-        )
-        .expect("应可解析");
-
-        assert_eq!(graph.nodes.len(), 4);
-        assert_eq!(graph.nodes[1].label, "授权检查");
-        assert!(graph.nodes[1].shape == Shape::Diamond);
-        assert!(graph.nodes[3].shape == Shape::Round);
-        let labels: Vec<_> = graph
-            .edges
-            .iter()
-            .filter_map(|edge| edge.label.as_deref())
-            .collect();
-        assert!(labels.contains(&"已激活"));
-        assert!(labels.contains(&"首次"));
     }
 }

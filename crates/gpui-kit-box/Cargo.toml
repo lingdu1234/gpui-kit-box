@@ -2,11 +2,12 @@
 name = "gpui-kit-box"
 version.workspace = true
 edition.workspace = true
-description = "GPUI Kit 演示程序：只保留 Markdown 文档页，内置公式与 Mermaid 流程图渲染。"
+description = "GPUI Kit 演示程序：按图表类型拆分的 Markdown 示例页，内置公式与 Mermaid 图表渲染。"
 
 [dependencies]
 gpui-kit.workspace = true
-gpui-kit-markdown-extras.workspace = true
+# 演示程序需要看到全部图表与公式；库本身 default = []，这里显式开满。
+gpui-kit-markdown-extras = { workspace = true, features = ["math", "mermaid"] }
 serde.workspace = true
 
 [build-dependencies]
