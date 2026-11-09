@@ -31,15 +31,15 @@ use gpui_kit::{
 
 use super::common::{clean_label, dashed_line, text_width};
 
-const PAD: f32 = 18.;
-const ROW_H: f32 = 30.;
-const SECTION_H: f32 = 26.;
-const TITLE_H: f32 = 30.;
-const AXIS_H: f32 = 28.;
-const BAR_H: f32 = 16.;
-const MIN_LABEL_W: f32 = 118.;
-const MIN_AXIS_W: f32 = 420.;
-const MAX_AXIS_W: f32 = 900.;
+const PAD: f32 = 24.;
+const ROW_H: f32 = 36.;
+const SECTION_H: f32 = 30.;
+const TITLE_H: f32 = 34.;
+const AXIS_H: f32 = 32.;
+const BAR_H: f32 = 18.;
+const MIN_LABEL_W: f32 = 132.;
+const MIN_AXIS_W: f32 = 560.;
+const MAX_AXIS_W: f32 = 1080.;
 
 // ---------------------------------------------------------------------------
 // 日期：civil <-> 1970-01-01 起的天数
@@ -659,12 +659,19 @@ pub(super) fn render(chart: &GanttChart, cx: &App) -> AnyElement {
         );
     }
 
+    // 刻度标签间距不足时跳过一部分，只保留网格线，日期不会叠成一团。
+    let mut label_right = f32::MIN;
     for (x, text) in &lay.ticks {
         let w = text_width(text, 10.) + 8.;
+        let left = x - w / 2.;
+        if left < label_right + 8. {
+            continue;
+        }
+        label_right = left + w;
         container = container.child(
             div()
                 .absolute()
-                .left(px(x - w / 2.))
+                .left(px(left))
                 .top(px(lay.axis_top - 18.))
                 .w(px(w))
                 .text_size(px(10.))

@@ -43,16 +43,16 @@ use gpui_kit::{
 
 use super::common::{clean_label, dashed_line, rounded_elbow, text_width};
 
-const PAD: f32 = 20.;
-const TITLE_H: f32 = 28.;
-const ANNO_H: f32 = 16.;
-const LINE_H: f32 = 18.;
-const EMPTY_CELL_H: f32 = 14.;
-const MIN_W: f32 = 116.;
-const H_GAP: f32 = 52.;
-const V_GAP: f32 = 74.;
-const NOTE_H: f32 = 30.;
-const NOTE_GAP: f32 = 14.;
+const PAD: f32 = 24.;
+const TITLE_H: f32 = 30.;
+const ANNO_H: f32 = 17.;
+const LINE_H: f32 = 20.;
+const EMPTY_CELL_H: f32 = 16.;
+const MIN_W: f32 = 132.;
+const H_GAP: f32 = 64.;
+const V_GAP: f32 = 88.;
+const NOTE_H: f32 = 32.;
+const NOTE_GAP: f32 = 18.;
 /// 首层上方留白：既放注记框，也放「层上方」这条备用布线带。
 const TOP_EXTRA: f32 = 60.;
 const BOTTOM_EXTRA: f32 = 44.;
@@ -141,9 +141,11 @@ fn link_hugs_edge(a: (f32, f32), c: (f32, f32), edges: &[EdgeDraw]) -> bool {
     (1..STEPS).any(|k| {
         let t = k as f32 / STEPS as f32;
         let q = (a.0 + (c.0 - a.0) * t, a.1 + (c.1 - a.1) * t);
-        edges
-            .iter()
-            .any(|e| e.points.windows(2).any(|s| point_segment_dist(q, s[0], s[1]) < 3.))
+        edges.iter().any(|e| {
+            e.points
+                .windows(2)
+                .any(|s| point_segment_dist(q, s[0], s[1]) < 3.)
+        })
     })
 }
 
@@ -958,8 +960,8 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
                     w: s.w,
                     h: s.h,
                 };
-                let hits_box = (0..n)
-                    .any(|j| j != ix && rects[j].w > 0. && overlap(cand, rects[j]));
+                let hits_box =
+                    (0..n).any(|j| j != ix && rects[j].w > 0. && overlap(cand, rects[j]));
                 let hits_edge = edges
                     .iter()
                     .any(|e| e.points.windows(2).any(|g| seg_hits_rect(g[0], g[1], cand)));
@@ -1006,7 +1008,11 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
             candidates.push((o.x + o.w + NOTE_GAP, o.y + o.h - s.h));
             candidates.push((o.x - s.w - NOTE_GAP, cy));
         }
-        let bottom = if vertical { main_size } else { cross_extent + PAD };
+        let bottom = if vertical {
+            main_size
+        } else {
+            cross_extent + PAD
+        };
         candidates.push((PAD, (bottom - PAD - s.h).max(PAD)));
         candidates.push((PAD, PAD));
 
@@ -1613,48 +1619,6 @@ mod tests {
         }
     }
 
-    /// 临时诊断：把 LR 图的真实布局导出成纯文本，供校对脚本重绘 PNG。
-    #[test]
-    fn dump_lr_layout_for_review() {
-        let d = parse(&lr_showcase()).unwrap();
-        let l = layout(&d);
-        let mut out = format!("SIZE {} {}\n", l.width, l.height);
-        for (i, c) in d.classes.iter().enumerate() {
-            let r = l.rects[i];
-            out.push_str(&format!(
-                "BOX {} {} {} {} {} {} | {} | {} | {}\n",
-                c.name.replace(' ', "_"),
-                if c.note { 1 } else { 0 },
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                c.attrs.join("§"),
-                c.methods.join("§"),
-                c.annotations.join("§"),
-            ));
-        }
-        for e in &l.edges {
-            let pts = e
-                .points
-                .iter()
-                .map(|p| format!("{},{}", p.0, p.1))
-                .collect::<Vec<_>>()
-                .join(";");
-            out.push_str(&format!("EDGE {} {}\n", if e.dashed { 1 } else { 0 }, pts));
-        }
-        for (x, y, t, _) in &l.labels {
-            out.push_str(&format!("LABEL {x} {y} {t}\n"));
-        }
-        for (x, y, t) in &l.mults {
-            out.push_str(&format!("MULT {x} {y} {t}\n"));
-        }
-        for (a, c) in &l.note_links {
-            out.push_str(&format!("NLINK {} {} {} {}\n", a.0, a.1, c.0, c.1));
-        }
-        std::fs::write("../../target/lr-layout.txt", out).unwrap();
-    }
-
     /// 所有展示页类图 + 基础夹具：注记框不能和任何框重叠，虚线不能穿框。
     #[test]
     fn notes_never_overlap_or_cross_other_boxes() {
@@ -1673,7 +1637,10 @@ mod tests {
             for &ni in &notes {
                 for (j, r) in l.rects.iter().enumerate() {
                     if j != ni {
-                        assert!(!overlap(l.rects[ni], *r), "第 {bi} 张图注记压住了第 {j} 个框");
+                        assert!(
+                            !overlap(l.rects[ni], *r),
+                            "第 {bi} 张图注记压住了第 {j} 个框"
+                        );
                     }
                 }
             }

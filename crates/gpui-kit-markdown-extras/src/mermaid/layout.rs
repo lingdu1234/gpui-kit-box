@@ -11,18 +11,18 @@ use std::collections::HashMap;
 
 use crate::estimate_width;
 
-pub(super) const NODE_H: f32 = 40.;
-pub(super) const H_GAP: f32 = 72.;
+pub(super) const NODE_H: f32 = 46.;
+pub(super) const H_GAP: f32 = 90.;
 /// 层间距的基数：每层之间至少留这么多高度，曲线与标签才不挤。
-pub(super) const GAP_BASE: f32 = 84.;
-pub(super) const PAD: f32 = 14.;
+pub(super) const GAP_BASE: f32 = 104.;
+pub(super) const PAD: f32 = 22.;
 pub(super) const FONT: f32 = 13.;
 /// 侧通道宽度：跨层长边与回边从这里绕开中间的行。
-pub(super) const LANE_W: f32 = 36.;
+pub(super) const LANE_W: f32 = 42.;
 /// 节点区与第一条侧通道之间再留一段空白，长线才会明显走在图的两侧。
-pub(super) const LANE_MARGIN: f32 = 30.;
-pub(super) const MIN_W: f32 = 140.;
-pub(super) const MAX_W: f32 = 260.;
+pub(super) const LANE_MARGIN: f32 = 38.;
+pub(super) const MIN_W: f32 = 152.;
+pub(super) const MAX_W: f32 = 300.;
 /// 指向目标框底部的箭头（回退边从下方收进去）。
 fn arrow_up(tx: f32, ty: f32) -> [(f32, f32); 3] {
     [(tx - 5., ty + 10.), (tx + 5., ty + 10.), (tx, ty)]

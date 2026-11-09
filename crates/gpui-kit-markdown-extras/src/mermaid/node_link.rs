@@ -54,7 +54,8 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
             });
         }
         if let Some((x1, y1, x2, y2)) = bounds {
-            overlays.push((x1 - 18., y1 - 26., x2 + 18., y2 + 18., ov.label.clone()));
+            // 外框上下留出的空间要放得下标题文字，同时别贴住相邻层。
+            overlays.push((x1 - 26., y1 - 34., x2 + 26., y2 + 26., ov.label.clone()));
         }
     }
     let notes: Vec<(f32, f32, String)> = graph
@@ -185,16 +186,21 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
     .absolute()
     .inset_0();
 
-    // 右侧注释可能探出布局宽度，容器要跟着变宽。
+    // 右侧注释与复合状态外框可能探出布局宽度，容器要跟着变宽变高。
     let mut canvas_width = layout.width;
+    let mut canvas_height = layout.height;
     for (x, _, text) in &notes {
         canvas_width = canvas_width.max(*x + estimate_width(text, 11.) + 16.);
+    }
+    for (_, _, x2, y2, _) in &overlays {
+        canvas_width = canvas_width.max(*x2 + PAD);
+        canvas_height = canvas_height.max(*y2 + PAD);
     }
 
     let mut container = div()
         .relative()
         .w(px(canvas_width))
-        .h(px(layout.height))
+        .h(px(canvas_height))
         .mx_auto()
         .child(paint);
 
