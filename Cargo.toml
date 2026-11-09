@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/gpui-kit-box"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+gpui-kit-markdown-extras = { path = "crates/gpui-kit-markdown-extras" }
+gpui-kit = { version = "^0.9.0", features = ["gpui-fast"] }
+serde = { version = "1", features = ["derive"] }
+embed-resource = "3"

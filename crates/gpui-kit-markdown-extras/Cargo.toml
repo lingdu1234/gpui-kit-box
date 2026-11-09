@@ -1,0 +1,16 @@
+[package]
+name = "gpui-kit-markdown-extras"
+version.workspace = true
+edition.workspace = true
+description = "GPUI TextView 的 Markdown 扩展插件：公式（$…$ / $$…$$）与 Mermaid flowchart 渲染。"
+license = "MIT"
+authors = ["lingdu <waong2005@126.com>"]
+repository = "https://github.com/lingdu1234/gpui-kit-box.git"
+homepage = "https://github.com/lingdu1234/gpui-kit-box"
+documentation = "https://docs.rs/gpui-kit-markdown-extras"
+readme = "README.md"
+keywords = ["gpui", "markdown", "math", "mermaid", "ui"]
+categories = ["gui", "rendering", "parsing"]
+
+[dependencies]
+gpui-kit.workspace = true

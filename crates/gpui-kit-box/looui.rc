@@ -1,0 +1,4 @@
+// gpui-fast 的 Windows 后端用 LoadImageW(模块句柄, MAKEINTRESOURCE(1), IMAGE_ICON) 取窗口类图标
+// （gpui-fast-windows platform.rs 的 load_icon），所以这里的资源 ID 必须是 1：
+// 同一份图标同时决定 exe 文件图标和标题栏/任务栏图标。
+1 ICON "assets/app-icon.ico"

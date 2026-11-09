@@ -1,0 +1,13 @@
+[package]
+name = "gpui-kit-box"
+version.workspace = true
+edition.workspace = true
+description = "GPUI Kit 演示程序：只保留 Markdown 文档页，内置公式与 Mermaid 流程图渲染。"
+
+[dependencies]
+gpui-kit.workspace = true
+gpui-kit-markdown-extras.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true
