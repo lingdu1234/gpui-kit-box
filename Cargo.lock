@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-box"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embed-resource",
  "gpui-kit",
@@ -2437,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-markdown-extras"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-kit",
 ]

@@ -1,6 +1,6 @@
 # 状态图
 
-Mermaid `stateDiagram-v2` 的四张示例：`[*]` 起止圆、`<<choice>>` 菱形、`<<fork>>` / `<<join>>` 同步条、复合状态外框与注释。
+Mermaid `stateDiagram-v2` 的四张示例：`[*]` 起止圆、`<<choice>>` 空心菱形、`<<fork>>` / `<<join>>`（有名字画成节点，只有内部标识符才画成同步条）、带标题栏的复合状态与注释。
 
 ## 1 基础：开关
 
@@ -16,7 +16,7 @@ stateDiagram-v2
 
 ## 2 中等：复合状态与选择
 
-`Running` 内部有自己的起止；`check` 是选择菱形，`fork1` 是同步条。
+`Running` 内部有自己的起止（成员名省掉 `Running::` 前缀）；`check` 是空心菱形，`fork1` 这种内部标识符才画成同步条。
 
 ```mermaid
 stateDiagram-v2
@@ -62,7 +62,7 @@ stateDiagram-v2
 
 ## 4 进阶：分叉与汇合
 
-`fork` 把一条流转拆成并行两支，`join` 再把它们同步汇合，最后发布并结束。
+`fork` 把一条流转拆成并行两支，`join` 再把它们同步汇合，最后发布并结束。两个名字都是有意义的词，因此画成带名字的状态节点，而不是一条光秃秃的同步条。
 
 ```mermaid
 stateDiagram-v2

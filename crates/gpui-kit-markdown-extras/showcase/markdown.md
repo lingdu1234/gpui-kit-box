@@ -5,7 +5,7 @@
 ## 1 列表
 
 1. 有序列表第一项
-2. 第二项，含行内代码 `with_plugins(TextView::markdown(id, md))`
+2. 第二项，含行内代码 `markdown(src).plugin(FlowchartPlugin::new())`
 3. 第三项
 
 - 无序项 A
@@ -18,10 +18,13 @@
 > 引用块用来放结论或注意事项：公式与五类图表都是原生元素，可随主题变色，也可以被选中复制。
 
 ```rust
-use gpui_kit::component::text::TextView;
-use gpui_kit_markdown_extras::with_plugins;
+use gpui_kit::component::text::markdown;
+use gpui_kit_markdown_extras::prelude::*;
 
-with_plugins(TextView::markdown("doc", SOURCE)).selectable(true)
+// 只挂这一页真正需要的插件；要全挂就用 with_plugins(view)
+markdown(SOURCE)
+    .plugin(FlowchartPlugin::new())
+    .selectable(true)
 ```
 
 ## 3 强调与表格

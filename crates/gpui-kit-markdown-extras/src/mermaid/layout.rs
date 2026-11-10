@@ -4,8 +4,8 @@
 //! 交叉 → 坐标修正推开重叠 → 跨层长边走左右侧通道。这里只把数据结构抽成公共
 //! 类型，让两类图能共用同一套布线，避免各自维护一份容易走样的布局器。
 //!
-//! 节点高度固定 [`NODE_H`]：复合状态这类「大框」由渲染层按成员包围盒额外描边，
-//! 不参与布局，因此状态图也能直接复用本引擎。
+//! 节点高度固定 [`NODE_H`]：状态图的复合状态以自身节点为锚点参与分层（内部
+//! 成员经虚拟边钉到锚点下方），外框按成员包围盒描边，因此两类图能共用本引擎。
 
 use std::collections::HashMap;
 
@@ -17,6 +17,17 @@ pub(super) const H_GAP: f32 = 90.;
 pub(super) const GAP_BASE: f32 = 104.;
 pub(super) const PAD: f32 = 22.;
 pub(super) const FONT: f32 = 13.;
+/// 复合状态外框顶部预留：标题栏 [`OVERLAY_HEADER`] 再加上下呼吸。
+pub(super) const OVERLAY_TOP: f32 = 34.;
+/// 复合状态标题栏高度。渲染层画分隔线与标题文字时也用它，改这里两处一起动。
+pub(super) const OVERLAY_HEADER: f32 = 26.;
+/// 复合状态外框底部到最后一行成员的留白。
+pub(super) const OVERLAY_BOTTOM: f32 = 26.;
+/// 复合状态第一层内部成员距「锚点行顶」的偏移。
+///
+/// 锚点自己是不画框的（外框就是它），所以内部第一层不必先走完一整行节点高度：
+/// 从锚点行顶往下让出标题栏加一点呼吸即可，否则标题栏下面会空出一大块。
+const OVERLAY_FIRST_INSET: f32 = 16.;
 /// 侧通道宽度：跨层长边与回边从这里绕开中间的行。
 pub(super) const LANE_W: f32 = 42.;
 /// 节点区与第一条侧通道之间再留一段空白，长线才会明显走在图的两侧。
@@ -45,10 +56,12 @@ pub(super) enum Shape {
     Bar,
 }
 
-/// 复合状态的外框：按成员节点的包围盒在渲染层描边，不参与分层布局。
+/// 复合状态的外框。`anchor` 是复合状态自身的节点：对外转移都连在它上面，
+/// 布局时它留在主链里，内部成员由虚拟边钉到它的正下方，外框按成员包围盒描边。
 #[derive(Clone)]
 pub(super) struct Overlay {
     pub(super) label: String,
+    pub(super) anchor: usize,
     pub(super) members: Vec<usize>,
 }
 
@@ -73,6 +86,8 @@ pub(super) struct Graph {
     pub(super) edges: Vec<GraphEdge>,
     /// 复合状态外框（flowchart 恒为空）。
     pub(super) overlays: Vec<Overlay>,
+    /// 复合状态的虚拟约束边 `(锚点, 内部根节点)`：只参与分层与列对齐，不绘制。
+    pub(super) pin_edges: Vec<(usize, usize)>,
     /// 依附在某个节点右侧的说明文字：`(节点, 文本)`。
     pub(super) notes: Vec<(usize, String)>,
 }
@@ -171,6 +186,9 @@ pub(super) struct Layout {
     /// 每个节点所在的层，供测试判断一条边是否跨层。
     #[allow(dead_code)]
     pub(super) ranks: Vec<usize>,
+    /// 复合状态外框矩形 `(x1, y1, x2, y2, 标题)`：渲染层直接描边，
+    /// 布线的贴边锚点（进出锚点的线贴框顶/框底）也依赖它。
+    pub(super) overlays: Vec<(f32, f32, f32, f32, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +229,14 @@ fn barycenter_pass(
                         keys.push(index_of[edge.from]);
                     } else if !downward && edge.from == node {
                         keys.push(index_of[edge.to]);
+                    }
+                }
+                // 虚拟边同样参与对齐：复合状态的内部链跟着锚点走。
+                for &(from, to) in graph.pin_edges.iter() {
+                    if downward && to == node {
+                        keys.push(index_of[from]);
+                    } else if !downward && from == node {
+                        keys.push(index_of[to]);
                     }
                 }
                 let key = if keys.is_empty() {
@@ -259,6 +285,13 @@ fn coordinate_pass(
                     };
                     if linked {
                         let other = if downward { edge.from } else { edge.to };
+                        centers.push(pos[other] + widths[other] / 2.);
+                    }
+                }
+                for &(from, to) in graph.pin_edges.iter() {
+                    let linked = if downward { to == node } else { from == node };
+                    if linked {
+                        let other = if downward { from } else { to };
                         centers.push(pos[other] + widths[other] / 2.);
                     }
                 }
@@ -355,15 +388,65 @@ fn blocked_between(
 pub(super) fn layout(graph: &Graph) -> Layout {
     let count = graph.nodes.len();
 
+    // 锚点 → 复合状态的桥：进出锚点的连线要贴外框顶/底边。
+    let mut anchor_ov: Vec<Option<usize>> = vec![None; count];
+    for (oi, ov) in graph.overlays.iter().enumerate() {
+        anchor_ov[ov.anchor] = Some(oi);
+    }
+
     // 分层：只走非回边，最长路径。回边已经排除，所以不会死循环。
+    // 虚拟边（锚点 → 内部根节点）同样参与：内部链被钉到锚点下一层。
+    let relax = |rank: &mut [usize], from: usize, to: usize, len: usize, changed: &mut bool| {
+        if rank[to] < rank[from] + len {
+            rank[to] = rank[from] + len;
+            *changed = true;
+        }
+    };
     let mut rank = vec![0usize; count];
     for _ in 0..count {
         let mut changed = false;
         for edge in graph.edges.iter().filter(|edge| !edge.back) {
-            if rank[edge.to] < rank[edge.from] + 1 {
-                rank[edge.to] = rank[edge.from] + 1;
-                changed = true;
+            relax(&mut rank, edge.from, edge.to, 1, &mut changed);
+        }
+        for &(from, to) in graph.pin_edges.iter() {
+            relax(&mut rank, from, to, 1, &mut changed);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 复合状态在纵向占 span+1 层：对外出边必须落到整个外框之下的层，
+    // 否则线会从框中间穿出去（旧实现的 Running --> check 正是这样）。
+    let mut anchor_outs: Vec<(usize, usize, usize)> = Vec::new();
+    for ov in &graph.overlays {
+        let span = ov
+            .members
+            .iter()
+            .filter(|&&m| m != ov.anchor)
+            .map(|&m| rank[m].saturating_sub(rank[ov.anchor]))
+            .max()
+            .unwrap_or(0);
+        for edge in graph
+            .edges
+            .iter()
+            .filter(|edge| !edge.back && edge.from == ov.anchor)
+        {
+            if !ov.members.contains(&edge.to) {
+                anchor_outs.push((ov.anchor, edge.to, span + 1));
             }
+        }
+    }
+    for _ in 0..count {
+        let mut changed = false;
+        for edge in graph.edges.iter().filter(|edge| !edge.back) {
+            relax(&mut rank, edge.from, edge.to, 1, &mut changed);
+        }
+        for &(from, to) in graph.pin_edges.iter() {
+            relax(&mut rank, from, to, 1, &mut changed);
+        }
+        for &(from, to, len) in anchor_outs.iter() {
+            relax(&mut rank, from, to, len, &mut changed);
         }
         if !changed {
             break;
@@ -465,12 +548,38 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         *value -= min;
     }
 
+    // ---- 纵向行位 ----
+    // 默认每行「节点高 + 层间距」。唯一的例外是复合状态的第一层内部成员：
+    // 锚点自己占了一行却不画框，若仍按整行间距往下排，标题栏与第一个内部
+    // 节点之间会空出 150px 上下（状态图里「起点离框顶太远」就是它）。
+    // 这一行改成从锚点行顶只让出标题栏 + 呼吸，外框也随之内收。
+    let mut below_anchor = vec![false; depth];
+    for ov in &graph.overlays {
+        let row = rank[ov.anchor] + 1;
+        if row < depth
+            && ov
+                .members
+                .iter()
+                .any(|&m| m != ov.anchor && rank[m] == row)
+        {
+            below_anchor[row] = true;
+        }
+    }
+    let mut row_y = vec![PAD; depth];
+    for row in 1..depth {
+        row_y[row] = if below_anchor[row] {
+            row_y[row - 1] + OVERLAY_FIRST_INSET
+        } else {
+            row_y[row - 1] + NODE_H + GAP_BASE
+        };
+    }
+
     // 整张图按实际占宽收边；行内不做二次居中，否则单节点的层会被硬拉到画面中央，
     // 反而离开它前驱的正下方（「填注册码」就是这种情况）。
     let provisional: Vec<Placed> = (0..count)
         .map(|node| Placed {
             x: pos[node],
-            y: PAD + rank[node] as f32 * (NODE_H + GAP_BASE),
+            y: row_y[rank[node]],
             w: widths[node],
         })
         .collect();
@@ -508,6 +617,11 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     let mut detours: Vec<usize> = (0..graph.edges.len())
         .filter(|&ix| {
             let edge = &graph.edges[ix];
+            // 复合状态的出边从外框底边出发（见 shape_y 的锚点分支），
+            // 不会擦到框内成员，按锚点自身的位置做穿框检测只会误判。
+            if anchor_ov[edge.from].is_some() {
+                return escaping[ix];
+            }
             escaping[ix]
                 || blocked_between(
                     &provisional,
@@ -593,7 +707,7 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         count
     ];
     for (row, list) in order.iter().enumerate() {
-        let y = PAD + row as f32 * (NODE_H + GAP_BASE);
+        let y = row_y[row];
         for &node in list {
             nodes[node] = Placed {
                 x: node_x0 + pos[node],
@@ -602,7 +716,31 @@ pub(super) fn layout(graph: &Graph) -> Layout {
             };
         }
     }
-    let height = PAD * 2. + depth as f32 * NODE_H + (depth.saturating_sub(1) as f32) * GAP_BASE;
+    let height = row_y[depth - 1] + NODE_H + PAD;
+
+    // 复合状态外框：成员（含锚点）包围盒外扩一圈，顶部留标题的空间；
+    // 锚点位于最顶层时不要再探出画布。
+    let mut overlays: Vec<(f32, f32, f32, f32, String)> = Vec::with_capacity(graph.overlays.len());
+    for ov in &graph.overlays {
+        let mut bounds: Option<(f32, f32, f32, f32)> = None;
+        for &ix in &ov.members {
+            let p = nodes[ix];
+            let quad = (p.x, p.y, p.x + p.w, p.y + NODE_H);
+            bounds = Some(match bounds {
+                Some((a, b, c, d)) => (a.min(quad.0), b.min(quad.1), c.max(quad.2), d.max(quad.3)),
+                None => quad,
+            });
+        }
+        if let Some((x1, y1, x2, y2)) = bounds {
+            overlays.push((
+                x1 - 26.,
+                (y1 - OVERLAY_TOP).max(2.),
+                x2 + 26.,
+                y2 + OVERLAY_BOTTOM,
+                ov.label.clone(),
+            ));
+        }
+    }
 
     let center = |ix: usize| nodes[ix].x + nodes[ix].w / 2.;
     let by_target = |a: &usize, b: &usize| {
@@ -652,7 +790,11 @@ pub(super) fn layout(graph: &Graph) -> Layout {
 
     // 进出点的纵向位置：方框取上下边；菱形按斜边求交点，让多个箭头落在
     // 菱形轮廓上，而不是全都挤在顶点那一个点上。
+    // 复合状态的锚点不画自身的框：进出它的线直接贴外框顶/底边。
     let shape_y = |node: usize, x: f32, top: bool| -> f32 {
+        if let Some(oi) = anchor_ov[node] {
+            return if top { overlays[oi].1 } else { overlays[oi].3 };
+        }
         let placed = &nodes[node];
         if graph.nodes[node].shape == Shape::Diamond {
             let cx = placed.x + placed.w / 2.;
@@ -924,5 +1066,6 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         edges,
         diamonds,
         ranks: rank,
+        overlays,
     }
 }

@@ -1,73 +1,215 @@
-//! 节点-连线图的 GPUI 渲染：`flowchart` 与 `stateDiagram` 共用。
+//! 节点-连线图的 GPUI 渲染：`flowchart` 与 `stateDiagram` 共用几何、分两套视觉语言。
 //!
-//! 连线、箭头、菱形/圆形/横条符号用 `canvas` 画，节点文字与边标签用绝对定位
-//! 的 `div` 画——文字排版与居中直接复用 GPUI 的布局能力。
+//! 两类图用的是同一份布局（`layout.rs`），但呈现方式略有不同：
+//!
+//! - [`NodeLinkStyle::Flowchart`]：淡底圆角框 + 实心三角箭头，尽量融进正文；
+//! - [`NodeLinkStyle::State`]：空心圆角框 + 开口 V 箭头，对齐 Mermaid 官方的
+//!   状态图观感——起止圆是强调色圆点 / 圆环，选择是空心菱形，同步条是强调色
+//!   粗条，复合状态画成带标题栏的圆角框，注释带虚线引线。
+//!
+//! 配色不在这里拼，统一来自 [`super::palette`]：两种风格只决定「填不填底色、
+//! 有没有标题栏、箭头实心还是开口」，线条与文字色始终是同一套色阶。
+//!
+//! 连线、箭头、符号用 `canvas` 画，节点文字与边标签用绝对定位的 `div` 画——
+//! 文字排版与居中直接复用 GPUI 的布局能力。
 
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::h_flex;
 use gpui_kit::{
-    AnyElement, App, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
+    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
 };
 
-use super::common::rounded_elbow;
+use super::common::{rounded_elbow, rounded_rect};
 use super::layout::*;
+use super::palette::{self, DiagramPalette};
 use crate::estimate_width;
 
-pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let (border, muted, line) = (theme.border, theme.muted, theme.muted_foreground);
+/// 两套视觉语言：几何相同、配色同源，只在「填充 / 标题栏 / 箭头样式」上分叉。
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum NodeLinkStyle {
+    Flowchart,
+    State,
+}
+
+/// 复合状态标题栏高度。取布局层的常量，保证「外框预留」和「标题栏实高」
+/// 不会各写一份数：布局按 [`OVERLAY_TOP`] 留顶、内部第一层按 [`OVERLAY_HEADER`]
+/// 定位，这里只负责把标题文字与分隔线放进同一条带子里。
+const HEADER_H: f32 = OVERLAY_HEADER;
+/// 注释框高度：比状态框矮一圈，读起来像「旁注」而不是又一个状态。
+const NOTE_H: f32 = NODE_H - 8.;
+
+/// 两种风格在共用配色上的差异：状态图是空心框（填页底色）且带标题栏，
+/// 流程图是淡表面填充、没有标题栏。箭头形状在绘制时直接按 `state` 分支。
+#[derive(Clone, Copy)]
+struct Style {
+    node_fill: Hsla,
+    frame_fill: Option<Hsla>,
+    header_fill: Option<Hsla>,
+    title: Hsla,
+}
+
+impl Style {
+    fn new(state: bool, pal: &DiagramPalette) -> Self {
+        if state {
+            Self {
+                node_fill: pal.background,
+                frame_fill: Some(pal.frame_fill),
+                header_fill: Some(pal.header_fill),
+                title: pal.text,
+            }
+        } else {
+            Self {
+                node_fill: pal.surface,
+                frame_fill: None,
+                header_fill: None,
+                title: pal.text_muted,
+            }
+        }
+    }
+}
+
+/// 注释框：位置、文本，以及连回所属状态的那条虚线贝塞尔。
+#[derive(Clone)]
+struct Note {
+    x: f32,
+    y: f32,
+    text: String,
+    link: NoteLink,
+}
+
+#[derive(Clone, Copy)]
+struct NoteLink {
+    from: (f32, f32),
+    c1: (f32, f32),
+    c2: (f32, f32),
+    to: (f32, f32),
+}
+
+/// 画在 canvas 上的几何符号。
+enum Symbol {
+    /// 起点 `[*]`：实心圆点。
+    Start(f32, f32),
+    /// 终点 `[*]`：外环 + 实心内点。
+    End(f32, f32),
+    /// `<<fork>>` / `<<join>>` 的同步条（没有名字时才画）。
+    Bar(f32, f32),
+    /// `<<choice>>`：空心菱形。
+    Diamond(f32, f32, f32, f32),
+}
+
+/// 形如 `fork1` / `paid_check` / `check` 的小写标识符：只是给图用的内部名字，
+/// 画到图上是噪音（Mermaid 也不显示），所以同步条与菱形都不带字。
+fn is_machine_id(label: &str) -> bool {
+    let mut chars = label.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// 复合状态里成员的显示名：`Running::Booting` 只留 `Booting`——外框标题已经
+/// 说明了它属于谁，重复前缀既占宽又难看。
+fn member_label(label: &str) -> &str {
+    label.rsplit("::").next().unwrap_or(label)
+}
+
+pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) -> AnyElement {
+    let state = style == NodeLinkStyle::State;
+    let pal = palette::of(cx);
+    let look = Style::new(state, &pal);
     let layout = layout(graph);
 
-    let mut paths: Vec<EdgePath> = Vec::new();
-    let mut heads: Vec<[(f32, f32); 3]> = Vec::new();
-    let mut labels: Vec<(f32, f32, String)> = Vec::new();
-    for edge in &layout.edges {
-        paths.push(edge.path.clone());
-        heads.push(edge.head);
-        if let Some(label) = &edge.label {
-            labels.push(label.clone());
-        }
-    }
-    let shapes = layout.diamonds.clone();
+    let paths: Vec<EdgePath> = layout.edges.iter().map(|e| e.path.clone()).collect();
+    let heads: Vec<[(f32, f32); 3]> = layout.edges.iter().map(|e| e.head).collect();
+    let labels: Vec<(f32, f32, String)> = layout
+        .edges
+        .iter()
+        .filter_map(|e| e.label.clone())
+        .collect();
 
-    // 状态图专用：起止圆、同步条由 canvas 画；复合状态外框按成员包围盒算。
-    let mut symbols: Vec<(u8, f32, f32)> = Vec::new();
+    // 起点 / 终点都画成 `[*]`：靠出入度区分，起点只有出边、终点只有入边。
+    let mut has_in = vec![false; graph.nodes.len()];
+    let mut has_out = vec![false; graph.nodes.len()];
+    for edge in &graph.edges {
+        has_out[edge.from] = true;
+        has_in[edge.to] = true;
+    }
+
+    let mut symbols: Vec<Symbol> = Vec::new();
     for (ix, node) in graph.nodes.iter().enumerate() {
         let p = layout.nodes[ix];
-        let kind = match node.shape {
-            Shape::Terminal => 1,
-            Shape::Bar => 2,
-            _ => continue,
-        };
-        symbols.push((kind, p.x + p.w / 2., p.y + NODE_H / 2.));
-    }
-    let mut overlays: Vec<(f32, f32, f32, f32, String)> = Vec::new();
-    for ov in &graph.overlays {
-        let mut bounds: Option<(f32, f32, f32, f32)> = None;
-        for &ix in &ov.members {
-            let Some(p) = layout.nodes.get(ix) else {
-                continue;
-            };
-            let quad = (p.x, p.y, p.x + p.w, p.y + NODE_H);
-            bounds = Some(match bounds {
-                Some((a, b, c, d)) => (a.min(quad.0), b.min(quad.1), c.max(quad.2), d.max(quad.3)),
-                None => quad,
-            });
-        }
-        if let Some((x1, y1, x2, y2)) = bounds {
-            // 外框上下留出的空间要放得下标题文字，同时别贴住相邻层。
-            overlays.push((x1 - 26., y1 - 34., x2 + 26., y2 + 26., ov.label.clone()));
+        let (cx, cy) = (p.x + p.w / 2., p.y + NODE_H / 2.);
+        match node.shape {
+            Shape::Terminal => {
+                if has_out[ix] && !has_in[ix] {
+                    symbols.push(Symbol::Start(cx, cy));
+                } else {
+                    symbols.push(Symbol::End(cx, cy));
+                }
+            }
+            // 有名字的 fork/join 当普通状态画（见下面节点框的分支），只有
+            // 名字是内部标识符时才退化成同步条。
+            Shape::Bar if is_machine_id(&node.label) => symbols.push(Symbol::Bar(cx, cy)),
+            _ => {}
         }
     }
-    let notes: Vec<(f32, f32, String)> = graph
+    // 菱形尺寸由布局层算（比文字框大一圈），直接搬过来。
+    for d in &layout.diamonds {
+        symbols.push(Symbol::Diamond(d.cx, d.cy, d.hw, d.hh));
+    }
+
+    // 复合状态外框矩形在布局层算好（布线的贴边锚点也依赖它），这里直接用。
+    let overlays = layout.overlays.clone();
+    // 图的右边界：注释默认贴在节点右侧，那一格被别的节点占了就退到整张图右边，
+    // 否则两个框会叠在一起（订单状态机里 Paid 右边的 Failed 就是这种情况）。
+    let graph_right = layout
+        .nodes
+        .iter()
+        .map(|p| p.x + p.w)
+        .chain(overlays.iter().map(|(_, _, x2, _, _)| *x2))
+        .fold(0., f32::max);
+    let notes: Vec<Note> = graph
         .notes
         .iter()
         .map(|(ix, text)| {
             let p = layout.nodes[*ix];
-            (p.x + p.w + 10., p.y, text.clone())
+            let w = estimate_width(text, 11.) + 20.;
+            let mut x = p.x + p.w + 16.;
+            let mut y = p.y;
+            let clash = layout.nodes.iter().enumerate().any(|(j, q)| {
+                j != *ix && q.x < x + w && q.x + q.w > x && q.y < p.y + NODE_H && q.y + NODE_H > p.y
+            });
+            let link = if clash {
+                // 右边那一格已经被别的状态占了：退到整张图右边、并下移半行，
+                // 引线从锚点右下角兜下去，才不会看起来像连着隔壁那个状态。
+                x = graph_right + 24.;
+                y = p.y + NODE_H + 22.;
+                let to = (x, y + NOTE_H / 2.);
+                NoteLink {
+                    from: (p.x + p.w, p.y + NODE_H),
+                    c1: (p.x + p.w + 34., p.y + NODE_H + 26.),
+                    c2: (to.0 - 44., to.1),
+                    to,
+                }
+            } else {
+                let to = (x, y + NOTE_H / 2.);
+                NoteLink {
+                    from: (p.x + p.w, p.y + NODE_H / 2.),
+                    c1: (p.x + p.w + 6., to.1),
+                    c2: (to.0 - 8., to.1),
+                    to,
+                }
+            };
+            Note {
+                x,
+                y,
+                text: text.clone(),
+                link,
+            }
         })
         .collect();
 
     let paint_overlays = overlays.clone();
+    let paint_notes = notes.clone();
 
     let paint = canvas(
         move |bounds, _, _| bounds.origin,
@@ -76,6 +218,7 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
             // 必须加上画布自身的原点，否则所有线条都会跑到窗口左上角。
             let (ox, oy) = (origin.x, origin.y);
             let at = |p: &(f32, f32)| point(ox + px(p.0), oy + px(p.1));
+
             for edge_path in &paths {
                 let mut builder = PathBuilder::stroke(px(1.2));
                 match edge_path {
@@ -88,97 +231,153 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
                     }
                 }
                 if let Ok(path) = builder.build() {
-                    window.paint_path(path, line);
+                    window.paint_path(path, pal.line);
                 }
             }
-            for head in &heads {
-                let mut builder = PathBuilder::fill();
-                builder.move_to(at(&(head[0].0, head[0].1)));
-                builder.line_to(at(&(head[1].0, head[1].1)));
-                builder.line_to(at(&(head[2].0, head[2].1)));
-                builder.close();
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, line);
+
+            // 箭头：状态图用开口的 V（贴近 Mermaid），流程图保留实心三角。
+            if state {
+                let mut barbs = PathBuilder::stroke(px(1.2));
+                for head in &heads {
+                    let tip = head[2];
+                    for corner in [head[0], head[1]] {
+                        // 三角顶点缩到 72%，把实心箭头的两条斜边留成 V 形箭头。
+                        let end = (
+                            tip.0 + (corner.0 - tip.0) * 0.72,
+                            tip.1 + (corner.1 - tip.1) * 0.72,
+                        );
+                        barbs.move_to(at(&tip));
+                        barbs.line_to(at(&end));
+                    }
+                }
+                if let Ok(path) = barbs.build() {
+                    window.paint_path(path, pal.line);
+                }
+            } else {
+                for head in &heads {
+                    let mut builder = PathBuilder::fill();
+                    builder.move_to(at(&(head[0].0, head[0].1)));
+                    builder.line_to(at(&(head[1].0, head[1].1)));
+                    builder.line_to(at(&(head[2].0, head[2].1)));
+                    builder.close();
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, pal.line);
+                    }
                 }
             }
-            // 复合状态外框画在连线之下、节点之上。
-            for (x1, y1, x2, y2, _) in &paint_overlays {
+
+            // 注释引线：虚线贝塞尔，先于外框与节点画（被节点盖住的部分自然消失）。
+            for note in &paint_notes {
+                let link = note.link;
                 let mut b = PathBuilder::stroke(px(1.));
-                b.move_to(at(&(*x1, *y1)));
-                b.line_to(at(&(*x2, *y1)));
-                b.line_to(at(&(*x2, *y2)));
-                b.line_to(at(&(*x1, *y2)));
-                b.close();
+                b.move_to(at(&link.from));
+                b.cubic_bezier_to(at(&link.to), at(&link.c1), at(&link.c2));
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, border);
+                    window.paint_path(path, pal.note_outline);
                 }
             }
-            // 起止圆（外环 + 实心内圆）与同步条。
-            for (kind, cx, cy) in &symbols {
-                if *kind == 1 {
-                    let outer = circle_points(*cx, *cy, 11.);
-                    let inner = circle_points(*cx, *cy, 6.);
-                    let mut fill = PathBuilder::fill();
-                    fill.move_to(at(&inner[0]));
-                    for p in &inner[1..] {
-                        fill.line_to(at(p));
+
+            // 复合状态外框画在连线之下、节点之上：底色 → 标题栏 → 分隔线 → 描边。
+            for (x1, y1, x2, y2, _) in &paint_overlays {
+                let (w, h) = (x2 - x1, y2 - y1);
+                if let Some(fill) = look.frame_fill {
+                    let mut b = PathBuilder::fill();
+                    rounded_rect(&mut b, &at, *x1, *y1, w, h, [8.; 4]);
+                    if let Ok(path) = b.build() {
+                        window.paint_path(path, fill);
                     }
-                    fill.close();
-                    if let Ok(path) = fill.build() {
-                        window.paint_path(path, line);
+                }
+                if let Some(fill) = look.header_fill {
+                    let mut b = PathBuilder::fill();
+                    rounded_rect(&mut b, &at, *x1, *y1, w, HEADER_H, [8., 8., 0., 0.]);
+                    if let Ok(path) = b.build() {
+                        window.paint_path(path, fill);
                     }
-                    let mut stroke = PathBuilder::stroke(px(1.2));
-                    stroke.move_to(at(&outer[0]));
-                    for p in &outer[1..] {
-                        stroke.line_to(at(p));
+                    let mut line = PathBuilder::stroke(px(1.));
+                    line.move_to(at(&(*x1, y1 + HEADER_H)));
+                    line.line_to(at(&(*x2, y1 + HEADER_H)));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, pal.frame_outline);
                     }
-                    stroke.close();
-                    if let Ok(path) = stroke.build() {
-                        window.paint_path(path, line);
-                    }
-                } else {
-                    let corners = [
-                        (*cx - 30., *cy - 4.),
-                        (*cx + 30., *cy - 4.),
-                        (*cx + 30., *cy + 4.),
-                        (*cx - 30., *cy + 4.),
-                    ];
-                    let mut fill = PathBuilder::fill();
-                    fill.move_to(at(&corners[0]));
-                    for p in &corners[1..] {
-                        fill.line_to(at(p));
-                    }
-                    fill.close();
-                    if let Ok(path) = fill.build() {
-                        window.paint_path(path, line);
-                    }
+                }
+                let mut b = PathBuilder::stroke(px(1.2));
+                rounded_rect(&mut b, &at, *x1, *y1, w, h, [8.; 4]);
+                if let Ok(path) = b.build() {
+                    window.paint_path(path, pal.frame_outline);
                 }
             }
-            // 菱形画在边之后：连线从框下方穿过时会被填充盖住。
-            for shape in &shapes {
-                let points = [
-                    (shape.cx, shape.cy - shape.hh),
-                    (shape.cx + shape.hw, shape.cy),
-                    (shape.cx, shape.cy + shape.hh),
-                    (shape.cx - shape.hw, shape.cy),
-                ];
-                let mut fill = PathBuilder::fill();
-                fill.move_to(at(&points[0]));
-                for p in &points[1..] {
-                    fill.line_to(at(p));
-                }
-                fill.close();
-                if let Ok(path) = fill.build() {
-                    window.paint_path(path, muted);
-                }
-                let mut stroke = PathBuilder::stroke(px(1.));
-                stroke.move_to(at(&points[0]));
-                for p in &points[1..] {
-                    stroke.line_to(at(p));
-                }
-                stroke.close();
-                if let Ok(path) = stroke.build() {
-                    window.paint_path(path, border);
+
+            // 几何符号：起止圆、同步条、选择菱形。
+            for symbol in &symbols {
+                match symbol {
+                    Symbol::Start(cx, cy) => {
+                        let mut fill = PathBuilder::fill();
+                        let points = circle_points(*cx, *cy, 6.);
+                        fill.move_to(at(&points[0]));
+                        for p in &points[1..] {
+                            fill.line_to(at(p));
+                        }
+                        fill.close();
+                        if let Ok(path) = fill.build() {
+                            window.paint_path(path, pal.outline);
+                        }
+                    }
+                    Symbol::End(cx, cy) => {
+                        let mut ring = PathBuilder::stroke(px(1.6));
+                        let outer = circle_points(*cx, *cy, 8.5);
+                        ring.move_to(at(&outer[0]));
+                        for p in &outer[1..] {
+                            ring.line_to(at(p));
+                        }
+                        ring.close();
+                        if let Ok(path) = ring.build() {
+                            window.paint_path(path, pal.outline);
+                        }
+                        let mut dot = PathBuilder::fill();
+                        let inner = circle_points(*cx, *cy, 3.8);
+                        dot.move_to(at(&inner[0]));
+                        for p in &inner[1..] {
+                            dot.line_to(at(p));
+                        }
+                        dot.close();
+                        if let Ok(path) = dot.build() {
+                            window.paint_path(path, pal.outline);
+                        }
+                    }
+                    Symbol::Bar(cx, cy) => {
+                        let mut b = PathBuilder::fill();
+                        rounded_rect(&mut b, &at, cx - 30., cy - 4.5, 60., 9., [4.5; 4]);
+                        if let Ok(path) = b.build() {
+                            window.paint_path(path, pal.outline);
+                        }
+                    }
+                    Symbol::Diamond(cx, cy, hw, hh) => {
+                        let points = [
+                            (*cx, cy - hh),
+                            (cx + hw, *cy),
+                            (*cx, cy + hh),
+                            (cx - hw, *cy),
+                        ];
+                        // 空心：先用页底色盖住穿过的连线，再描边。
+                        let mut fill = PathBuilder::fill();
+                        fill.move_to(at(&points[0]));
+                        for p in &points[1..] {
+                            fill.line_to(at(p));
+                        }
+                        fill.close();
+                        if let Ok(path) = fill.build() {
+                            window.paint_path(path, look.node_fill);
+                        }
+                        let mut stroke = PathBuilder::stroke(px(1.4));
+                        stroke.move_to(at(&points[0]));
+                        for p in &points[1..] {
+                            stroke.line_to(at(p));
+                        }
+                        stroke.close();
+                        if let Ok(path) = stroke.build() {
+                            window.paint_path(path, pal.frame_outline);
+                        }
+                    }
                 }
             }
         },
@@ -189,8 +388,9 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
     // 右侧注释与复合状态外框可能探出布局宽度，容器要跟着变宽变高。
     let mut canvas_width = layout.width;
     let mut canvas_height = layout.height;
-    for (x, _, text) in &notes {
-        canvas_width = canvas_width.max(*x + estimate_width(text, 11.) + 16.);
+    for note in &notes {
+        canvas_width = canvas_width.max(note.x + estimate_width(&note.text, 11.) + 24.);
+        canvas_height = canvas_height.max(note.y + NOTE_H);
     }
     for (_, _, x2, y2, _) in &overlays {
         canvas_width = canvas_width.max(*x2 + PAD);
@@ -204,10 +404,22 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
         .mx_auto()
         .child(paint);
 
+    // 复合状态的锚点不画自身的方框：外框就是复合状态，标题画在标题栏里。
+    let mut anchors = vec![false; graph.nodes.len()];
+    for ov in &graph.overlays {
+        anchors[ov.anchor] = true;
+    }
     for (ix, node) in graph.nodes.iter().enumerate() {
+        if anchors[ix] {
+            continue;
+        }
         let placed = &layout.nodes[ix];
+        let label = member_label(&node.label);
         if node.shape == Shape::Diamond {
-            // 菱形由 canvas 画（见上面的 shapes），这里只放居中的文字。
+            // 菱形由 canvas 画（见上面的 symbols），内部标识符不写字。
+            if is_machine_id(&node.label) {
+                continue;
+            }
             container = container.child(
                 div()
                     .absolute()
@@ -219,30 +431,22 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
                     .items_center()
                     .justify_center()
                     .text_size(px(FONT))
-                    .child(div().text_center().px_1().child(node.label.clone())),
+                    .child(div().text_center().px_1().child(label.to_string())),
             );
             continue;
         }
-        if matches!(node.shape, Shape::Terminal | Shape::Bar) {
-            // 几何符号由 canvas 画；同步条把名字放在条下方。
-            if node.shape == Shape::Bar && !node.label.is_empty() {
-                container = container.child(
-                    div()
-                        .absolute()
-                        .left(px(placed.x))
-                        .top(px(placed.y + NODE_H))
-                        .w(px(placed.w))
-                        .text_size(px(10.))
-                        .text_color(line)
-                        .text_center()
-                        .child(node.label.clone()),
-                );
-            }
-            continue;
+        if node.shape == Shape::Terminal {
+            continue; // 起止圆由 canvas 画，不带文字
         }
-        let radius = match node.shape {
-            Shape::Round => px(18.),
-            _ => px(6.),
+        if node.shape == Shape::Bar && is_machine_id(&node.label) {
+            continue; // 同步条由 canvas 画，名字只在有语义时才有意义
+        }
+        let radius = if state {
+            px(6.)
+        } else if node.shape == Shape::Round {
+            px(18.)
+        } else {
+            px(6.)
         };
         container = container.child(
             div()
@@ -257,10 +461,11 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
                 .overflow_hidden()
                 .rounded(radius)
                 .border_1()
-                .border_color(border)
-                .bg(muted)
+                .border_color(pal.outline)
+                .bg(look.node_fill)
                 .text_size(px(FONT))
-                .child(div().text_center().px_2().child(node.label.clone())),
+                .text_color(pal.text)
+                .child(div().text_center().px_2().child(label.to_string())),
         );
     }
 
@@ -268,34 +473,36 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
         container = container.child(
             h_flex()
                 .absolute()
-                .left(px(*x1 + 6.))
-                .top(px(*y1 + 2.))
-                .px(px(3.))
-                .bg(theme.background)
+                .left(px(*x1 + 10.))
+                .top(px(if look.header_fill.is_some() {
+                    *y1 + (HEADER_H - 16.) / 2.
+                } else {
+                    *y1 + 2.
+                }))
                 .text_size(px(11.))
-                .text_color(line)
+                .text_color(look.title)
                 .child(label.clone()),
         );
     }
-    for (x, y, text) in &notes {
-        let w = estimate_width(text, 11.) + 12.;
+    for note in &notes {
+        let w = estimate_width(&note.text, 11.) + 20.;
         container = container.child(
             div()
                 .absolute()
-                .left(px(*x))
-                .top(px(*y + 4.))
+                .left(px(note.x))
+                .top(px(note.y))
                 .w(px(w))
-                .h(px(NODE_H - 8.))
+                .h(px(NOTE_H))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(4.))
                 .border_1()
-                .border_color(border)
-                .bg(muted)
-                .text_size(px(10.))
-                .text_color(line)
-                .child(div().text_center().child(text.clone())),
+                .border_color(pal.note_outline)
+                .bg(pal.note_fill)
+                .text_size(px(11.))
+                .text_color(pal.text_muted)
+                .child(div().text_center().child(note.text.clone())),
         );
     }
 
@@ -310,9 +517,9 @@ pub(super) fn render_node_link(graph: &Graph, cx: &App) -> AnyElement {
                 .top(px(y - 8.))
                 .px(px(3.))
                 .rounded(px(4.))
-                .bg(theme.background)
+                .bg(pal.background)
                 .text_size(px(11.))
-                .text_color(line)
+                .text_color(pal.text_muted)
                 .child(text),
         );
     }
@@ -328,4 +535,26 @@ fn circle_points(cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
             (cx + r * a.cos(), cy + r * a.sin())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_ids_are_not_drawn_as_text() {
+        for id in ["fork1", "join", "check", "paid_check"] {
+            assert!(is_machine_id(id), "{id} 应视作内部标识符");
+        }
+        for name in ["Fork", "Join", "Check", "等待指令", "Build"] {
+            assert!(!is_machine_id(name), "{name} 应视作可显示的名字");
+        }
+    }
+
+    #[test]
+    fn composite_members_drop_their_prefix() {
+        assert_eq!(member_label("Running::Booting"), "Booting");
+        assert_eq!(member_label("Paying::Waiting"), "Waiting");
+        assert_eq!(member_label("Idle"), "Idle");
+    }
 }

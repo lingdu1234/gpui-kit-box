@@ -1,6 +1,6 @@
 # 甘特图
 
-Mermaid `gantt` 的四张示例：`done` / `active` / `crit` 用主题语义色区分，里程碑画菱形，`excludes weekends` 会把时间轴压成工作日。
+Mermaid `gantt` 的四张示例：任务名写在条形里，`done` / `active` / `crit` 用主题语义色区分，里程碑是空心菱形，`excludes weekends` 把周末涂成淡色竖带。
 
 ## 1 基础：小型迭代
 
@@ -41,11 +41,11 @@ gantt
 
 ## 3 复杂：工作日排期
 
-`excludes weekends` 去掉周末，`crit` 标出关键路径，联调依赖两个前序任务。
+`excludes weekends` 把周末标成淡色竖带、时长只数工作日，`crit` 标出关键路径，联调依赖两个前序任务。
 
 ```mermaid
 gantt
-    title 发布计划（工作日轴）
+    title 发布计划（周末标灰）
     dateFormat YYYY-MM-DD
     axisFormat %m/%d
     tickInterval 3d

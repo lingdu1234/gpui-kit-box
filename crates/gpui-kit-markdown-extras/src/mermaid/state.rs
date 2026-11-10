@@ -2,8 +2,16 @@
 //!
 //! 状态图与流程图同属「节点 + 连线」，因此解析结果就是 [`layout::Graph`]，
 //! 直接复用 `layout.rs` 的分层布线与 `node_link.rs` 的绘制，不另造一套布局器。
-//! `[*]` 画成起止圆，`<<choice>>` 画菱形，`<<fork>>`/`<<join>>` 画同步条；
-//! 复合状态的外框按成员包围盒在渲染层描边，不参与分层。
+//!
+//! 符号约定（对齐 Mermaid 官方状态图的观感）：
+//!
+//! - `[*]` 画出起点实心圆 / 终点圆环，靠出入度区分，不靠书写顺序；
+//! - `<<choice>>` 是空心菱形；
+//! - `<<fork>>` / `<<join>>`：名字是 `fork1`、`join1` 这类内部标识符时画成
+//!   同步条（Mermaid 的默认行为），名字是有意义的词（`Fork` / `Join`）时
+//!   画成普通状态节点——不然名字只能压在条子底下，既看不清也没意义；
+//! - 复合状态以自身节点为锚点参与分层，内部成员经虚拟边钉到锚点下方，
+//!   外框按成员包围盒描边，顶部留出标题栏，成员名省掉 `Running::` 前缀。
 //!
 //! ```text
 //! stateDiagram-v2
@@ -120,6 +128,7 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut overlays: Vec<Overlay> = Vec::new();
+    let mut pins: Vec<(usize, usize)> = Vec::new();
     let mut notes: Vec<(usize, String)> = Vec::new();
     let mut i = 0usize;
 
@@ -141,10 +150,14 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
         }
 
         // 复合状态：内部转移的前缀隔离成 `X::子状态`，外框包住整组节点。
+        // 锚点（复合状态自身节点）留在主链里接对外转移；没有内部入边的
+        // 成员（如内部的 `[*]`）用虚拟边钉到锚点下一层，内部链因此排在
+        // 锚点正下方，外框是它们整体的包围盒。
         if lower.starts_with("state ") && line.ends_with('{') {
             let name = line[6..line.len() - 1].trim();
             let parent = node_ix(&mut nodes, &mut index, name, name, Shape::Rect);
             let mut members = vec![parent];
+            let mut inner_pairs: Vec<(usize, usize)> = Vec::new();
             while i < lines.len() {
                 let inner = lines[i].trim();
                 i += 1;
@@ -174,9 +187,16 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
                 if !members.contains(&to) {
                     members.push(to);
                 }
+                inner_pairs.push((from, to));
+            }
+            for &m in members.iter().skip(1) {
+                if !inner_pairs.iter().any(|&(_, t)| t == m) {
+                    pins.push((parent, m));
+                }
             }
             overlays.push(Overlay {
                 label: clean_label(name),
+                anchor: parent,
                 members,
             });
             continue;
@@ -231,6 +251,7 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
         nodes,
         edges,
         overlays,
+        pin_edges: pins,
         notes,
     })
 }
@@ -295,5 +316,101 @@ mod tests {
             assert!(p.x >= 0. && p.x + p.w <= l.width + 0.5);
             assert!(p.y >= 0. && p.y + super::super::layout::NODE_H <= l.height + 0.5);
         }
+    }
+
+    /// 复合状态是「超节点」：内部链钉在锚点正下方，锚点的对外出边落到整个
+    /// 外框之下，外框只包住成员——框外节点（Created）在框上方、出边目标
+    /// （paid_check）在框下方，外框顶部也不能越出画布。
+    #[test]
+    fn composite_wraps_only_its_members() {
+        let src = super::super::showcase_blocks("state")
+            .into_iter()
+            .find(|b| b.contains("state Paying {"))
+            .expect("展示页应有 Paying 复合状态");
+        let g = parse(&src).unwrap();
+        let l = super::super::layout::layout(&g);
+        let anchor = g.nodes.iter().position(|n| n.label == "Paying").unwrap();
+        let created = g.nodes.iter().position(|n| n.label == "Created").unwrap();
+        let paid_check = g
+            .nodes
+            .iter()
+            .position(|n| n.label == "paid_check")
+            .unwrap();
+        let ov = g.overlays.iter().find(|ov| ov.anchor == anchor).unwrap();
+        let inner: Vec<usize> = ov.members.iter().copied().filter(|&m| m != anchor).collect();
+        assert!(!inner.is_empty(), "复合状态应有内部成员");
+        for &m in &inner {
+            assert!(
+                l.ranks[m] > l.ranks[anchor],
+                "内部成员应钉在锚点下方"
+            );
+        }
+        for e in &g.edges {
+            if e.from == anchor && !inner.contains(&e.to) {
+                for &m in &inner {
+                    assert!(
+                        l.ranks[e.to] > l.ranks[m],
+                        "锚点的对外出边应落到所有内部成员之下"
+                    );
+                }
+            }
+        }
+        let Some(&(x1, y1, x2, y2, _)) = l.overlays.first() else {
+            panic!("布局应输出外框矩形");
+        };
+        assert!(y1 >= 0., "外框顶部不能越出画布");
+        let node_h = super::super::layout::NODE_H;
+        let cr = l.nodes[created];
+        assert!(cr.y + node_h <= y1, "Created 被外框吞掉了");
+        let pr = l.nodes[paid_check];
+        assert!(pr.y >= y2, "paid_check 应在外框下方");
+        for &m in &inner {
+            let p = l.nodes[m];
+            assert!(
+                p.x >= x1 && p.x + p.w <= x2 && p.y >= y1 && p.y + node_h <= y2,
+                "内部成员应全部落在外框内"
+            );
+        }
+    }
+
+    /// 复合状态标题栏下面不能空一大片。
+    ///
+    /// 锚点自己是不画框的，内部第一层若仍按整行间距（节点高 + 层间距 = 150px）
+    /// 往下排，标题栏到第一个内部节点之间就会空出 130px 上下，整张图被白白拉长。
+    /// 这里锁住「标题栏 → 第一层」的净空，顺带确认外框仍然包得住成员。
+    #[test]
+    fn composite_first_layer_hugs_the_header() {
+        use super::super::layout::{NODE_H, OVERLAY_HEADER};
+        let mut checked = 0;
+        for src in super::super::showcase_blocks("state") {
+            let g = parse(&src).unwrap();
+            let l = super::super::layout::layout(&g);
+            for (oi, ov) in g.overlays.iter().enumerate() {
+                let (x1, y1, _, y2, _) = l.overlays[oi];
+                let anchor = l.nodes[ov.anchor].y;
+                let first = ov
+                    .members
+                    .iter()
+                    .filter(|&&m| m != ov.anchor)
+                    .map(|&m| l.nodes[m])
+                    .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap())
+                    .expect("复合状态应有内部成员");
+                let gap = first.y - (y1 + OVERLAY_HEADER);
+                assert!(
+                    (0. ..=40.).contains(&gap),
+                    "「{}」标题栏到第一层的净空是 {gap:.0}px，太浪费了",
+                    ov.label
+                );
+                assert!(
+                    first.y < anchor + NODE_H + 8.,
+                    "「{}」第一层应紧贴锚点行，而不是被整行间距推下去",
+                    ov.label
+                );
+                assert!(first.y >= y1 && first.y + NODE_H <= y2, "内部成员被挤出外框");
+                assert!(x1 < first.x, "外框左边界异常");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "展示页应至少有一张带复合状态的状态图");
     }
 }

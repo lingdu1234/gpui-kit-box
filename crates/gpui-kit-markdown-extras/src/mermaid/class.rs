@@ -28,20 +28,20 @@
 //! `note for X` 不参与分层：TB/BT 贴在宿主类上方，LR/RL 贴在宿主类的左侧/右侧，
 //! 用短虚线连过去；候选位置会主动避开其它类框。
 //!
-//! 配色不复用 `theme.border` / `theme.muted_foreground`：这两个 token 本身就是
-//! 「弱化」色阶（浅色 neutral-200/500、深色 neutral-800/400），在深色背景上
-//! 几乎看不见。类图统一用 `theme.info`（cyan-500/400）画边框、分隔线、关系线、
-//! 端点符号与注记，文字用 `theme.foreground`，与 Mermaid.js 默认观感一致。
+//! 配色统一来自 [`super::palette`]（与状态图 / 流程图 / 时序图同一套色阶）：
+//! 类框边框与分隔线用 `outline`，关系线、端点符号与注记虚线用 `line`，
+//! 类框底用 `surface`，文字用 `text`。不再单独挑一个主题色，
+//! 也不再复用 `border` / `muted_foreground` 这类弱化色阶当线条色。
 
 use std::collections::HashMap;
 
-use gpui_kit::component::theme::ThemeColor;
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::h_flex;
 use gpui_kit::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
+    AnyElement, App, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
 };
 
 use super::common::{clean_label, dashed_line, rounded_elbow, text_width};
+use super::palette;
 
 const PAD: f32 = 24.;
 const TITLE_H: f32 = 30.;
@@ -64,35 +64,6 @@ const EDGE_W: f32 = 1.8;
 const MARKER_W: f32 = 1.5;
 const NOTE_FRAME_W: f32 = 1.5;
 const NOTE_LINK_W: f32 = 1.6;
-
-/// 类图专用配色。抽成纯函数便于在明/暗两套主题下做回归测试，
-/// 也避免渲染层到处散落 `theme.border` 之类的弱对比 token。
-#[derive(Clone, Copy)]
-struct Palette {
-    /// 类框边框、两道分隔线、关系线、端点符号、注记框与注记连线。
-    stroke: Hsla,
-    /// 类框与注记框底色。
-    fill: Hsla,
-    /// 类名、成员、注解、标签、多重度。
-    text: Hsla,
-    /// 标签遮挡底色、空心端点符号内部填充。
-    chip: Hsla,
-}
-
-fn palette(theme: &ThemeColor) -> Palette {
-    // 自定义主题可能把 info 调回和 border 一样淡；退回前景色保证始终有对比。
-    let stroke = if theme.info == theme.border {
-        theme.foreground
-    } else {
-        theme.info
-    };
-    Palette {
-        stroke,
-        fill: theme.muted,
-        text: theme.foreground,
-        chip: theme.background,
-    }
-}
 
 /// 取矩形朝向另一矩形中心的那条边的中点，作为注记虚线的端点。
 /// 这样注记在左/右/上/下都能自动选对连接边，不用按方向写四套坐标。
@@ -555,7 +526,8 @@ struct ClassLayout {
     edges: Vec<EdgeDraw>,
     /// `(x, y, 文本, 所属边序号)`，测试用来保证标签贴自己的线。
     labels: Vec<(f32, f32, String, usize)>,
-    mults: Vec<(f32, f32, String)>,
+    /// `(x, y, 文本, 所属边序号)`，测试用来保证多重度不与本边标签重叠。
+    mults: Vec<(f32, f32, String, usize)>,
     /// 按类索引存放 `(x, y, w)`：每个非注释类框两道分隔线。
     dividers: Vec<Vec<(f32, f32, f32)>>,
     /// 注释框 → 宿主类的短虚线。
@@ -887,8 +859,8 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
             });
         }
 
-        // 标签放在较长的那段出/入竖线上，而不是两端锚点的几何中点——
-        // 后者会落在别的线上，看起来像标签贴错了关系。
+        // 标签放在折线中间段（布线带里那段）的中点，即整条边的视觉中部——
+        // 靠近两端锚点的短段上还有多重度与菱形/箭头，标签放那儿会叠在一起。
         if let Some(text) = &r.label {
             let (x, y) = if points.len() == 2 {
                 (
@@ -896,17 +868,10 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
                     (points[0].1 + points[1].1) / 2.,
                 )
             } else {
-                let last = points.len() - 1;
-                let first_seg = (points[0], points[1]);
-                let last_seg = (points[last - 1], points[last]);
-                let len =
-                    |p: ((f32, f32), (f32, f32))| (p.1.0 - p.0.0).abs() + (p.1.1 - p.0.1).abs();
-                let seg = if len(first_seg) >= len(last_seg) {
-                    first_seg
-                } else {
-                    last_seg
-                };
-                ((seg.0.0 + seg.1.0) / 2., (seg.0.1 + seg.1.1) / 2.)
+                (
+                    (points[1].0 + points[2].0) / 2.,
+                    (points[1].1 + points[2].1) / 2.,
+                )
             };
             labels.push((x, y, text.clone(), ei));
         }
@@ -919,6 +884,7 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
                 points[0].0 + out.0 * 12. + 8.,
                 points[0].1 + out.1 * 12.,
                 text.clone(),
+                ei,
             ));
         }
         if let Some(text) = &r.b_mult {
@@ -927,6 +893,7 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
                 points[last].0 + out.0 * 12. + 8.,
                 points[last].1 + out.1 * 12.,
                 text.clone(),
+                ei,
             ));
         }
         edges.push(EdgeDraw {
@@ -1101,7 +1068,7 @@ fn marker_points(m: &Marker) -> Vec<(f32, f32)> {
 }
 
 pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
-    let p = palette(cx.theme());
+    let pal = palette::of(cx);
     let lay = layout(diagram);
     let sizes = sizes(diagram);
 
@@ -1153,7 +1120,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                 fill.line_to(at(&(r.x, r.y + r.h)));
                 fill.close();
                 if let Ok(path) = fill.build() {
-                    window.paint_path(path, p.fill);
+                    window.paint_path(path, pal.surface);
                 }
             }
 
@@ -1168,7 +1135,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     rounded_elbow(&mut b, points, 8., &at);
                 }
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, p.stroke);
+                    window.paint_path(path, pal.line);
                 }
                 for (poly, filled, kind) in markers {
                     if *kind == MarkerKind::Open {
@@ -1176,7 +1143,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                         seg!(open, poly[0], poly[1]);
                         seg!(open, poly[2], poly[1]);
                         if let Ok(path) = open.build() {
-                            window.paint_path(path, p.stroke);
+                            window.paint_path(path, pal.line);
                         }
                         continue;
                     }
@@ -1187,7 +1154,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     }
                     fill.close();
                     if let Ok(path) = fill.build() {
-                        window.paint_path(path, if *filled { p.stroke } else { p.chip });
+                        window.paint_path(path, if *filled { pal.line } else { pal.background });
                     }
                     let mut stroke = PathBuilder::stroke(px(MARKER_W));
                     stroke.move_to(at(&poly[0]));
@@ -1196,7 +1163,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     }
                     stroke.close();
                     if let Ok(path) = stroke.build() {
-                        window.paint_path(path, p.stroke);
+                        window.paint_path(path, pal.line);
                     }
                 }
             }
@@ -1206,7 +1173,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                 let mut b = PathBuilder::stroke(px(NOTE_LINK_W));
                 dashed_line(&mut b, *a, *c, &at);
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, p.stroke);
+                    window.paint_path(path, pal.line);
                 }
             }
 
@@ -1223,7 +1190,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     dashed_line(&mut b, corners[k], corners[(k + 1) % 4], &at);
                 }
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, p.stroke);
+                    window.paint_path(path, pal.line);
                 }
             }
         },
@@ -1251,8 +1218,8 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     .h(px(r.h))
                     .rounded(px(4.))
                     .border_2()
-                    .border_color(p.stroke)
-                    .bg(p.fill),
+                    .border_color(pal.outline)
+                    .bg(pal.surface),
             );
             // 两道分隔线：表头 / 属性 / 方法，跟 Mermaid 的三栏类框一致。
             // 用 layout 算好的坐标，避免渲染层再算一遍导致两边走样；
@@ -1265,7 +1232,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                         .top(px(*y))
                         .w(px((w - 4.).max(1.)))
                         .h(px(DIVIDER_H))
-                        .bg(p.stroke),
+                        .bg(pal.outline),
                 );
             }
         }
@@ -1279,7 +1246,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     .top(px(r.y + 2. + k as f32 * ANNO_H))
                     .w(px((r.w - 12.).max(1.)))
                     .text_size(px(10.))
-                    .text_color(p.text)
+                    .text_color(pal.text)
                     .text_center()
                     .child(anno_text(anno)),
             );
@@ -1292,7 +1259,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                 .top(px(r.y + anno_h + (if c.note { 6. } else { 3. })))
                 .w(px((r.w - 12.).max(1.)))
                 .text_size(px(if c.note { 11. } else { 13. }))
-                .text_color(p.text)
+                .text_color(pal.text)
                 .text_center()
                 .child(c.name.clone()),
         );
@@ -1309,7 +1276,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     .top(px(attrs_y + k as f32 * LINE_H))
                     .w(px((r.w - 16.).max(1.)))
                     .text_size(px(11.))
-                    .text_color(p.text)
+                    .text_color(pal.text)
                     .child(member.clone()),
             );
         }
@@ -1322,7 +1289,7 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                     .top(px(methods_y + k as f32 * LINE_H))
                     .w(px((r.w - 16.).max(1.)))
                     .text_size(px(11.))
-                    .text_color(p.text)
+                    .text_color(pal.text)
                     .child(member.clone()),
             );
         }
@@ -1336,13 +1303,13 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                 .left(px((x - w / 2.).clamp(0., (lay.width - w).max(0.))))
                 .top(px(y - 8.))
                 .px(px(3.))
-                .bg(p.chip)
+                .bg(pal.background)
                 .text_size(px(11.))
-                .text_color(p.text)
+                .text_color(pal.text)
                 .child(text.clone()),
         );
     }
-    for (x, y, text) in &lay.mults {
+    for (x, y, text, _) in &lay.mults {
         let w = text_width(text, 10.) + 6.;
         container = container.child(
             div()
@@ -1350,9 +1317,9 @@ pub(super) fn render(diagram: &ClassDiagram, cx: &App) -> AnyElement {
                 .left(px((x - w / 2.).clamp(0., (lay.width - w).max(0.))))
                 .top(px(y - 7.))
                 .px(px(2.))
-                .bg(p.chip)
+                .bg(pal.background)
                 .text_size(px(10.))
-                .text_color(p.text)
+                .text_color(pal.text)
                 .child(text.clone()),
         );
     }
@@ -1507,6 +1474,35 @@ mod tests {
         }
     }
 
+    /// 标签 chip 与同一条边的多重度 chip 不能叠在一起：旧实现把标签放在
+    /// 贴近端点的短段中点上，正好压住端点多重度（「包含」叠住「1」和菱形）。
+    #[test]
+    fn labels_do_not_overlap_multiplicities() {
+        let chip = |x: f32, y: f32, text: &str, size: f32, pad: f32| {
+            let w = text_width(text, size) + pad;
+            (x - w / 2. + 1., y - 8. + 1., w - 2., 15.)
+        };
+        for src in [SAMPLE.to_string(), showcase()] {
+            let d = parse(&src).unwrap();
+            let l = layout(&d);
+            for (lx, ly, ltext, lei) in &l.labels {
+                let (l_x, l_y, l_w, l_h) = chip(*lx, *ly, ltext, 11., 10.);
+                for (mx, my, mtext, mei) in &l.mults {
+                    if mei != lei {
+                        continue;
+                    }
+                    let (m_x, m_y, m_w, m_h) = chip(*mx, *my, mtext, 10., 6.);
+                    let separated =
+                        l_x + l_w < m_x || m_x + m_w < l_x || l_y + l_h < m_y || m_y + m_h < l_y;
+                    assert!(
+                        separated,
+                        "标签「{ltext}」与多重度「{mtext}」重叠（{src:?}）"
+                    );
+                }
+            }
+        }
+    }
+
     /// 展示页的四张类图（含 LR 三层架构、泛型、聚合）都要能排布且不穿框。
     #[test]
     fn all_showcase_class_diagrams_route_cleanly() {
@@ -1558,17 +1554,10 @@ mod tests {
             .expect("展示页应有 PaymentClient 类图")
     }
 
-    /// 明/暗主题都不能再用 `border` 当类图线条颜色：它天生是弱化色阶。
-    /// 同时锁住线宽，避免以后又改回 1px 导致深色背景下看不见。
+    /// 线条颜色的可见性由公共配色（`palette.rs`）统一保证；这里只锁类图的线宽，
+    /// 避免以后又改回 1px 导致深色背景下看不见。
     #[test]
-    fn palette_is_visible_in_light_and_dark_themes() {
-        use gpui_kit::component::theme::ThemeColor;
-        for theme in [ThemeColor::light(), ThemeColor::dark()] {
-            let p = palette(&theme);
-            assert_ne!(p.stroke, theme.border, "线条不能复用弱对比的 border");
-            assert_ne!(p.stroke, theme.muted_foreground, "线条不能复用弱化文字色");
-            assert_ne!(p.text, theme.muted_foreground, "文字必须用前景色");
-        }
+    fn line_widths_stay_visible() {
         assert!(EDGE_W >= 1.5 && MARKER_W >= 1.5 && NOTE_LINK_W >= 1.5);
         assert!(DIVIDER_H > 1. && NOTE_FRAME_W >= 1.5);
     }

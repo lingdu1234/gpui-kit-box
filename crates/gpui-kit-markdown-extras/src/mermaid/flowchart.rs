@@ -49,6 +49,7 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
         nodes,
         edges,
         overlays: Vec::new(),
+        pin_edges: Vec::new(),
         notes: Vec::new(),
     })
 }

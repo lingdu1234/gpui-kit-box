@@ -23,34 +23,50 @@
 //! 布局是「参与者等距分列 + 事件逐行下排」：每个消息/注释占一行，组合片段
 //! 用栈记录起止行，最后按行区间画外框；激活框同样按行区间沿生命线画。
 //! 这套模型与流程图的图层布局完全不同，所以本模块自带布局，不复用 `layout.rs`。
+//!
+//! 纵向节奏由几段「带」拼出来：片段开头（类型标签 + 首段守卫）、`else` / `and`
+//! 分隔守卫、消息行、片段结尾。守卫必须独占一条带——早期版本把分隔守卫直接
+//! 画在行带顶，11px 文字与下一行消息文字只差 5px，`[支付失败]` 就压在
+//! 「返回失败码」上。所有文字块的坐标都在布局层算好（`SeqLayout::labels` /
+//! `FragBox`），`texts_never_cover_each_other` 用同一份几何做两两相交检查。
+//!
+//! 配色与其他图共用 [`super::palette`]：生命线 / 消息线 / 箭头是强调色，
+//! 参与者框是淡表面，文字分正文与次级两档。
 
 use std::collections::HashMap;
 
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::h_flex;
 use gpui_kit::{
     AnyElement, App, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
 };
 
 use super::common::{clean_label, text_width};
+use super::palette;
 
 const PAD: f32 = 18.;
 const HEAD_Y: f32 = 12.;
 const HEAD_H: f32 = 36.;
 const COL_GAP: f32 = 100.;
 const MIN_COL_W: f32 = 112.;
-const ROW_H: f32 = 52.;
+const ROW_H: f32 = 56.;
 const TOP_GAP: f32 = 30.;
 const ACT_W: f32 = 12.;
 const FONT: f32 = 12.;
-/// 片段上下留白：开始/结束行前各插一段空隙，标签与消息不会互相压住。
-const FRAG_HEADER: f32 = 20.;
-const FRAG_FOOTER: f32 = 20.;
+/// 片段开头留白：放得下类型标签（alt/par/…）与首段守卫，下面还留一条消息文字的
+/// 空间。以前只有 20px，守卫底边离第一条消息的文字只有 5px，视觉上像压在字上。
+const FRAG_HEADER: f32 = 32.;
+const FRAG_FOOTER: f32 = 24.;
+/// 分隔（`else` / `and`）前的留白：守卫独立占一条横带，不会与这一行的
+/// 消息文字抢同一行。
+const FRAG_SPLIT: f32 = 26.;
 /// 相邻片段之间再留一点间距，边框与标签才分得开。
-const FRAG_PAD: f32 = 6.;
+const FRAG_PAD: f32 = 8.;
 /// 片段外框只包住实际参与的参与者，左右各留这么多空白。
 const FRAG_SIDE_MARGIN: f32 = 30.;
-/// 只有一个参与者的片段也保持最小宽度，守卫文字才放得下。
-const FRAG_MIN_W: f32 = 160.;
+/// 只有一个参与者的片段也保持最小宽度：类型标签 + 守卫要排得开。
+const FRAG_MIN_W: f32 = 180.;
+/// 消息文字底边到箭头线的距离：文字压在线上方，留一点空隙。
+const LABEL_DY: f32 = 24.;
 
 // ---------------------------------------------------------------------------
 // 图结构
@@ -422,13 +438,77 @@ struct SeqLayout {
     row_y: Vec<f32>,
     notes: Vec<(Note, usize, f32, f32, f32)>, // note, row, x, y, w
     messages: Vec<(Message, usize)>,
+    /// 消息文字块 `(左边距, 上边距, 文本)`。
+    labels: Vec<(f32, f32, String)>,
     fragments: Vec<FragBox>,
     activations: Vec<(f32, f32, f32, f32)>,
     /// 底部复刻的参与者框/小人所在的 y。
     bottom_head_y: f32,
 }
 
-/// 组合片段外框：标签拆成 `kind`（左上角标签）与 `label`（首段守卫）。
+impl SeqLayout {
+    /// 所有「文字块」的包围盒 `(种类, x, y, w, h)`（画布坐标）。
+    ///
+    /// 渲染层按这些坐标画文字，回归测试拿同一份几何做两两相交检查——
+    /// 时序图里最常见的毛病就是两块字叠在一起，肉眼很难在改动时全部盯住。
+    #[cfg(test)]
+    fn text_rects(&self) -> Vec<(&'static str, f32, f32, f32, f32)> {
+        let mut rects = Vec::new();
+        for (x, y, text) in &self.labels {
+            rects.push(("消息", *x, *y, text_width(text, 11.) + 10., 15.));
+        }
+        for (_, _, x, y, w) in &self.notes {
+            rects.push(("注释", *x, *y, *w, 26.));
+        }
+        for f in &self.fragments {
+            rects.push((
+                "片段标签",
+                f.x1,
+                f.y1 - 9.,
+                text_width(&f.kind, 10.) + 12.,
+                16.,
+            ));
+            if !f.label.is_empty() {
+                rects.push((
+                    "首段守卫",
+                    f.label_x,
+                    f.y1 + 2.,
+                    text_width(&f.label, 11.) + 4.,
+                    15.,
+                ));
+            }
+            for (band, text, x) in &f.splits {
+                if !text.is_empty() {
+                    rects.push((
+                        "分隔守卫",
+                        *x,
+                        *band + 2.,
+                        text_width(text, 11.) + 4.,
+                        15.,
+                    ));
+                }
+            }
+        }
+        for (msg, row) in &self.messages {
+            if msg.number.is_some() {
+                rects.push((
+                    "编号",
+                    self.xs[msg.from] - 8.,
+                    self.row_y[*row] - 8.,
+                    16.,
+                    16.,
+                ));
+            }
+        }
+        rects
+    }
+}
+
+/// 组合片段外框：左上角的类型标签（`kind`）、各段守卫与它们的落位。
+///
+/// 守卫的位置在布局层就算好——它既要居中，又必须给类型标签让位，还要和
+/// 下面那行的消息文字错开。放在这里算一次，渲染与回归测试读的是同一份坐标，
+/// 不会再出现「布局认为没压住、渲染出来却叠在一起」。
 #[derive(Clone)]
 struct FragBox {
     x1: f32,
@@ -436,8 +516,12 @@ struct FragBox {
     x2: f32,
     y2: f32,
     kind: String,
+    /// 首段守卫（已带方括号）；片段没写标签时为空。
     label: String,
-    splits: Vec<(f32, String)>,
+    /// 首段守卫的左边距。
+    label_x: f32,
+    /// 分隔守卫：`(横带顶 y, 文本（带方括号）, 左边距)`。
+    splits: Vec<(f32, String, f32)>,
 }
 
 fn layout(seq: &Sequence) -> SeqLayout {
@@ -461,24 +545,37 @@ fn layout(seq: &Sequence) -> SeqLayout {
         .collect();
     let top = HEAD_Y + HEAD_H + TOP_GAP;
 
-    // 片段开始/结束都在对应行前插一段空隙：标签、守卫与消息各占一行，
-    // 复杂图（片段嵌套、连续片段）不会挤在一起。
+    // 片段开始/结束/分隔（`else`、`and`）都在对应行前插一段空隙：
+    // 标签、守卫与消息各占一行，复杂图（片段嵌套、连续片段）不会挤在一起。
+    //
+    // 分隔尤其不能省：守卫原来直接画在该行的行带顶，跟这一行消息的文字
+    // 只差 5px，`[支付失败]` 会压在「返回失败码」上——看起来就是文字被遮盖。
     let mut starts = vec![0usize; seq.rows + 1];
     let mut ends = vec![0usize; seq.rows + 1];
+    let mut split_rows = vec![0usize; seq.rows + 1];
     for f in &seq.fragments {
         starts[f.start.min(seq.rows)] += 1;
         ends[f.end.min(seq.rows)] += 1;
+        for (row, _) in &f.splits {
+            split_rows[(*row).min(seq.rows)] += 1;
+        }
     }
     let mut row_top = Vec::with_capacity(seq.rows + 1);
     let mut cursor = top;
     for r in 0..=seq.rows {
-        cursor += starts[r] as f32 * FRAG_HEADER + ends[r] as f32 * FRAG_FOOTER;
+        cursor += starts[r] as f32 * FRAG_HEADER
+            + ends[r] as f32 * FRAG_FOOTER
+            + split_rows[r] as f32 * FRAG_SPLIT;
         row_top.push(cursor);
         cursor += ROW_H;
     }
     // 片段前一行内容的底边（row_top 已经减掉本行的片段留白）。
-    let prev_bottom =
-        |r: usize| row_top[r] - starts[r] as f32 * FRAG_HEADER - ends[r] as f32 * FRAG_FOOTER;
+    let prev_bottom = |r: usize| {
+        row_top[r]
+            - starts[r] as f32 * FRAG_HEADER
+            - ends[r] as f32 * FRAG_FOOTER
+            - split_rows[r] as f32 * FRAG_SPLIT
+    };
     let row_y: Vec<f32> = row_top
         .iter()
         .take(seq.rows)
@@ -510,6 +607,22 @@ fn layout(seq: &Sequence) -> SeqLayout {
         }
     }
 
+    // 消息文字块：横向居中在两位参与者之间，贴边时夹回画布内。
+    // 坐标在布局层算好，渲染照抄、回归测试也读这一份，避免两边各算一套。
+    let labels: Vec<(f32, f32, String)> = messages
+        .iter()
+        .filter_map(|(msg, row)| {
+            let text = message_label(msg);
+            if text.is_empty() {
+                return None;
+            }
+            let w = text_width(&text, 11.) + 10.;
+            let mid = (xs[msg.from] + xs[msg.to]) / 2.;
+            let x = (mid - w / 2.).clamp(0., (width - w).max(0.));
+            Some((x, row_y[*row] - LABEL_DY, text))
+        })
+        .collect();
+
     // 每个片段只框住它内部事件实际涉及的参与者，而不是整张图的宽度。
     let fragment_spans: Vec<Option<(usize, usize)>> = seq
         .fragments
@@ -539,6 +652,8 @@ fn layout(seq: &Sequence) -> SeqLayout {
         })
         .collect();
 
+    // 同一行上的分隔（多层片段同时 else）依次占带，跨片段共享这个游标。
+    let mut split_seen = vec![0usize; seq.rows + 1];
     let fragments = seq
         .fragments
         .iter()
@@ -561,18 +676,38 @@ fn layout(seq: &Sequence) -> SeqLayout {
             // 底边落在结束行前的留白里，相邻片段之间自然留出空隙。
             let y2 =
                 (prev_bottom(f.end) + ends[f.end] as f32 * FRAG_FOOTER - FRAG_PAD).max(y1 + 26.);
-            let splits = f
+            // 守卫水平居中，左边界要让开左上角的类型标签（alt/par/break）：
+            // 窄片段里「break」和「[无法继续]」原来贴在一起，看着像文字叠字。
+            let kind_w = text_width(&f.kind, 10.) + 20.;
+            let guard_x = |text: &str| {
+                let w = text_width(text, 11.);
+                let center = (x1 + x2 - w) / 2.;
+                center.max(x1 + kind_w).min((x2 - w - 6.).max(x1 + 4.))
+            };
+            // 分隔守卫各自占一条横带：同一行有多个 `else` / `and` 时从下往上叠，
+            // 守卫文字落在带顶，下面的消息文字才不会被压住。
+            let splits: Vec<(f32, String, f32)> = f
                 .splits
                 .iter()
-                .map(|(row, label)| (row_top[*row], label.clone()))
+                .map(|(row, label)| {
+                    let row = (*row).min(seq.rows);
+                    let slot = split_seen[row];
+                    split_seen[row] += 1;
+                    let band = row_top[row] - (split_rows[row] - slot) as f32 * FRAG_SPLIT;
+                    let text = bracket(label);
+                    let x = guard_x(&text);
+                    (band, text, x)
+                })
                 .collect();
+            let label = bracket(&f.label);
             FragBox {
                 x1,
                 y1,
                 x2,
                 y2,
                 kind: f.kind.clone(),
-                label: f.label.clone(),
+                label_x: guard_x(&label),
+                label,
                 splits,
             }
         })
@@ -598,6 +733,7 @@ fn layout(seq: &Sequence) -> SeqLayout {
         row_y,
         notes,
         messages,
+        labels,
         fragments,
         activations,
         bottom_head_y,
@@ -609,18 +745,21 @@ fn message_label(msg: &Message) -> String {
     msg.text.clone()
 }
 
+/// 片段守卫统一套方括号（`[令牌有效]`）；没写标签时保持空串，不画框。
+fn bracket(label: &str) -> String {
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("[{label}]")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 渲染
 // ---------------------------------------------------------------------------
 
 pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let (border, muted, line, bg) = (
-        theme.border,
-        theme.muted,
-        theme.muted_foreground,
-        theme.background,
-    );
+    let pal = palette::of(cx);
     let lay = layout(seq);
 
     // 画进 canvas 的数据先 cloned 出来，闭包要 'static。
@@ -658,7 +797,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 let mut b = PathBuilder::stroke(px(1.));
                 seg!(b, (x, data.head_bottom), (x, data.bottom_head_y));
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, line);
+                    window.paint_path(path, pal.line);
                 }
             }
 
@@ -670,11 +809,11 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 for k in 0..4 {
                     super::common::dashed_line(&mut b, corners[k], corners[(k + 1) % 4], &at);
                 }
-                for (sy, _) in &frag.splits {
+                for (sy, _, _) in &frag.splits {
                     super::common::dashed_line(&mut b, (x1, *sy), (x2, *sy), &at);
                 }
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, line);
+                    window.paint_path(path, pal.line);
                 }
             }
 
@@ -688,7 +827,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 fill.line_to(at(&(x, y + h)));
                 fill.close();
                 if let Ok(path) = fill.build() {
-                    window.paint_path(path, muted);
+                    window.paint_path(path, pal.surface);
                 }
             }
 
@@ -714,7 +853,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                     seg!(b, (x1, y), (tail_x, y));
                 }
                 if let Ok(path) = b.build() {
-                    window.paint_path(path, line);
+                    window.paint_path(path, pal.line);
                 }
 
                 let tip = if msg.from == msg.to {
@@ -733,7 +872,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                         seg!(cross, (tip.0 - 5., tip.1 - 5.), (tip.0 + 5., tip.1 + 5.));
                         seg!(cross, (tip.0 - 5., tip.1 + 5.), (tip.0 + 5., tip.1 - 5.));
                         if let Ok(path) = cross.build() {
-                            window.paint_path(path, line);
+                            window.paint_path(path, pal.line);
                         }
                     }
                     Arrow::Bidi => {
@@ -746,7 +885,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                             heads.close();
                         }
                         if let Ok(path) = heads.build() {
-                            window.paint_path(path, line);
+                            window.paint_path(path, pal.line);
                         }
                     }
                     // 只有实线消息用实心三角；虚线回复按截图画细的开放箭头。
@@ -758,7 +897,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                         head.line_to(at(&t[2]));
                         head.close();
                         if let Ok(path) = head.build() {
-                            window.paint_path(path, line);
+                            window.paint_path(path, pal.line);
                         }
                     }
                     _ => {
@@ -767,7 +906,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                         seg!(open, (tip.0 + back, tip.1 - 4.), tip);
                         seg!(open, (tip.0 + back, tip.1 + 4.), tip);
                         if let Ok(path) = open.build() {
-                            window.paint_path(path, line);
+                            window.paint_path(path, pal.line);
                         }
                     }
                 }
@@ -790,7 +929,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                     seg!(b, (cx, cy + 8.), (cx - 5., cy + 14.));
                     seg!(b, (cx, cy + 8.), (cx + 5., cy + 14.));
                     if let Ok(path) = b.build() {
-                        window.paint_path(path, line);
+                        window.paint_path(path, pal.line);
                     }
                 }
             }
@@ -819,7 +958,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                         .w(px(80.))
                         .text_size(px(FONT))
                         .text_center()
-                        .text_color(theme.foreground)
+                        .text_color(pal.text)
                         .child(p.label.clone()),
                 );
             }
@@ -838,10 +977,10 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                     .justify_center()
                     .rounded(px(6.))
                     .border_1()
-                    .border_color(border)
-                    .bg(muted)
+                    .border_color(pal.outline)
+                    .bg(pal.surface)
                     .text_size(px(FONT))
-                    .text_color(theme.foreground)
+                    .text_color(pal.text)
                     .child(div().text_center().px_2().child(p.label.clone())),
             );
         }
@@ -857,42 +996,39 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
-                .bg(muted)
+                .bg(pal.surface)
                 .text_size(px(10.))
-                .text_color(line)
+                .text_color(pal.text_muted)
                 .child(frag.kind.clone()),
         );
-        let guard_left =
-            |text: &str| ((frag.x1 + frag.x2 - text_width(text, 11.)) / 2.).max(frag.x1 + 40.);
+        // 守卫的横向位置由布局层算好（居中 + 给类型标签让位），这里只管画。
         if !frag.label.is_empty() {
-            let text = format!("[{}]", frag.label);
             container = container.child(
                 div()
                     .absolute()
-                    .left(px(guard_left(&text)))
+                    .left(px(frag.label_x))
                     .top(px(frag.y1 + 2.))
                     .px(px(2.))
-                    .bg(bg)
+                    .bg(pal.background)
                     .text_size(px(11.))
-                    .text_color(line)
-                    .child(text),
+                    .text_color(pal.text_muted)
+                    .child(frag.label.clone()),
             );
         }
-        for (sy, text) in &frag.splits {
+        for (sy, text, x) in &frag.splits {
             if text.is_empty() {
                 continue;
             }
-            let text = format!("[{text}]");
             container = container.child(
                 div()
                     .absolute()
-                    .left(px(guard_left(&text)))
+                    .left(px(*x))
                     .top(px(*sy + 2.))
                     .px(px(2.))
-                    .bg(bg)
+                    .bg(pal.background)
                     .text_size(px(11.))
-                    .text_color(line)
-                    .child(text),
+                    .text_color(pal.text_muted)
+                    .child(text.clone()),
             );
         }
     }
@@ -914,34 +1050,27 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 .justify_center()
                 .rounded(px(8.))
                 .border_1()
-                .border_color(line)
-                .bg(bg)
+                .border_color(pal.outline)
+                .bg(pal.background)
                 .text_size(px(9.))
-                .text_color(theme.foreground)
+                .text_color(pal.text)
                 .child(format!("{number}")),
         );
     }
 
-    // 消息标签
-    for (msg, row) in &lay.messages {
-        let label = message_label(msg);
-        if label.is_empty() {
-            continue;
-        }
-        let w = text_width(&label, 11.) + 10.;
-        let mid = (lay.xs[msg.from] + lay.xs[msg.to]) / 2.;
-        let x = (mid - w / 2.).clamp(0., (lay.width - w).max(0.));
+    // 消息标签：坐标由布局层算好（见 `SeqLayout::labels`）。
+    for (x, y, text) in &lay.labels {
         container = container.child(
             h_flex()
                 .absolute()
-                .left(px(x))
-                .top(px(lay.row_y[*row] - 19.))
+                .left(px(*x))
+                .top(px(*y))
                 .px(px(3.))
                 .rounded(px(3.))
-                .bg(bg)
+                .bg(pal.background)
                 .text_size(px(11.))
-                .text_color(line)
-                .child(label),
+                .text_color(pal.text_muted)
+                .child(text.clone()),
         );
     }
 
@@ -958,9 +1087,9 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 .items_center()
                 .justify_center()
                 .rounded(px(5.))
-                .bg(muted)
+                .bg(pal.surface)
                 .text_size(px(11.))
-                .text_color(line)
+                .text_color(pal.text_muted)
                 .child(div().text_center().child(note.text.clone())),
         );
     }
@@ -1087,9 +1216,96 @@ mod tests {
         );
     }
 
+    /// 守卫必须独占一条横带，而且要让开左上角的类型标签。
+    ///
+    /// 旧实现把 `else` / `and` 守卫直接画在行带顶：11px 文字约 15px 高，
+    /// 下面那条消息的文字起点只差 5px，`[支付失败]` 就压在「返回失败码」上，
+    /// 看起来像文字被涂掉了。窄片段里 `break` 与 `[无法继续]` 也会贴在一起。
     #[test]
-    fn fragment_frames_cover_only_involved_participants() {
-        let blocks = super::super::showcase_blocks("sequence");
+    fn guards_get_their_own_band() {
+        // 11px 文字的实际行高约 14px，取 15 留一点余量。
+        const TEXT_H: f32 = 15.;
+        let mut checked = 0;
+        for (bi, src) in super::super::showcase_blocks("sequence").iter().enumerate() {
+            let seq = parse(src).unwrap();
+            let l = layout(&seq);
+            for (fi, f) in seq.fragments.iter().enumerate() {
+                let fb = &l.fragments[fi];
+                let kind_right = fb.x1 + text_width(&f.kind, 10.) + 16.;
+                let first_label = |row: usize| {
+                    l.messages
+                        .iter()
+                        .find(|(_, r)| *r == row)
+                        .map(|(_, r)| l.row_y[*r] - LABEL_DY)
+                };
+                if !f.label.is_empty() {
+                    if let Some(top) = first_label(f.start) {
+                        assert!(
+                            fb.y1 + 2. + TEXT_H <= top,
+                            "第 {bi} 张图「{}」的守卫压住了第一行消息",
+                            f.kind
+                        );
+                        checked += 1;
+                    }
+                    assert!(
+                        fb.label_x >= kind_right - 0.5 || fb.label_x + 4. <= fb.x1,
+                        "第 {bi} 张图「{}」的守卫挤到了类型标签上",
+                        f.kind
+                    );
+                }
+                for ((band, text, x), (row, _)) in fb.splits.iter().zip(f.splits.iter()) {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let top = first_label(*row).unwrap_or(*band + FRAG_SPLIT);
+                    assert!(
+                        *band + 2. + TEXT_H <= top,
+                        "第 {bi} 张图「{}」的分隔守卫 {text} 与第 {row} 行消息同高",
+                        f.kind
+                    );
+                    assert!(
+                        *x >= kind_right - 0.5,
+                        "第 {bi} 张图的分隔守卫 {text} 挤到了类型标签上"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 4, "展示页应检查到多条守卫，实际 {checked}");
+    }
+
+    /// 展示页四张时序图里，任意两块文字都不能叠在一起。
+    ///
+    /// 时序图的文字全是绝对定位：消息标签、注释、片段类型标签、守卫、编号圆圈。
+    /// 只要布局少算一段间距，两块字就会互相盖住，改起来又很容易顾此失彼——
+    /// 这里把渲染用的同一份几何拿来做两两相交检查。
+    #[test]
+    fn texts_never_cover_each_other() {
+        let mut checked = 0;
+        for (bi, src) in super::super::showcase_blocks("sequence").iter().enumerate() {
+            let seq = parse(src).unwrap_or_else(|| panic!("第 {bi} 张时序图无法解析"));
+            let l = layout(&seq);
+            let rects = l.text_rects();
+            checked += rects.len();
+            for (i, a) in rects.iter().enumerate() {
+                for b in rects.iter().skip(i + 1) {
+                    let (an, ax, ay, aw, ah) = *a;
+                    let (bn, bx, by, bw, bh) = *b;
+                    let ox = (ax + aw).min(bx + bw) - ax.max(bx);
+                    let oy = (ay + ah).min(by + bh) - ay.max(by);
+                    assert!(
+                        ox <= 0.5 || oy <= 0.5,
+                        "第 {bi} 张图：{an}（{ax:.0},{ay:.0} {aw:.0}×{ah:.0}）\
+                         与 {bn}（{bx:.0},{by:.0} {bw:.0}×{bh:.0}）重叠了 {ox:.1}×{oy:.1}"
+                    );
+                }
+            }
+        }
+        assert!(checked >= 20, "四张展示图合计只检查到 {checked} 块文字，范围不对");
+    }
+
+    #[test]
+    fn fragment_frames_cover_only_involved_participants() {        let blocks = super::super::showcase_blocks("sequence");
         let seq = parse(&blocks[1]).expect("登录示例应可解析");
         let l = layout(&seq);
         let alt = &l.fragments[0];

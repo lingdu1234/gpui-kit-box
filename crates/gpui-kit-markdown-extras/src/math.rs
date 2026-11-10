@@ -22,6 +22,33 @@ pub struct InlineMathPlugin;
 /// 独立公式块：`$$\bar{x} = \frac{\sum x_i}{n}$$`。
 pub struct MathBlockPlugin;
 
+impl InlineMathPlugin {
+    /// 插件没有可配置项，构造是零成本的。保留 `new()` 是为了调用点写法统一
+    /// （`markdown(src).plugin(InlineMathPlugin::new())`），也给将来加配置留位置。
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for InlineMathPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MathBlockPlugin {
+    /// 同 [`InlineMathPlugin::new`]：零成本构造，只为调用点写法统一。
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MathBlockPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarkdownPlugin for InlineMathPlugin {
     fn name(&self) -> &str {
         "inline-math"

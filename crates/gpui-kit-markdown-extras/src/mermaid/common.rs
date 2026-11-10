@@ -61,8 +61,7 @@ pub(super) fn arrow_at(x: f32, y: f32, dir: u8) -> [(f32, f32); 3] {
 }
 
 /// 把折线画成圆角：拐角处用二次曲线过渡，观感和 Mermaid 的曲线接近。
-pub(super) fn rounded_elbow<F>(
-    builder: &mut PathBuilder,
+pub(super) fn rounded_elbow<F>(    builder: &mut PathBuilder,
     points: &[(f32, f32)],
     radius: f32,
     at: &F,
@@ -96,4 +95,60 @@ pub(super) fn rounded_elbow<F>(
     if let Some(last) = points.last() {
         builder.line_to(at(last));
     }
+}
+
+/// 圆角矩形：`PathBuilder` 只有直线和贝塞尔，四角用三次贝塞尔近似四分之一圆。
+///
+/// `radii` 依次是左上 / 右上 / 右下 / 左下——复合状态的标题栏只需要上方两个圆角，
+/// 圆角半径也会被夹到不超过半宽半高，避免小矩形画出畸形弧。
+pub(super) fn rounded_rect<F>(
+    builder: &mut PathBuilder,
+    at: &F,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radii: [f32; 4],
+) where
+    F: Fn(&(f32, f32)) -> Point<Pixels>,
+{
+    // 四分之一圆的三次贝塞尔控制点系数（标准 kappa）。
+    const K: f32 = 0.552_284_8;
+    let (x1, y1, x2, y2) = (x, y, x + w, y + h);
+    let [tl, tr, br, bl] = radii.map(|r| r.max(0.).min(w / 2.).min(h / 2.));
+
+    builder.move_to(at(&(x1 + tl, y1)));
+    builder.line_to(at(&(x2 - tr, y1)));
+    if tr > 0. {
+        builder.cubic_bezier_to(
+            at(&(x2, y1 + tr)),
+            at(&(x2 - tr + tr * K, y1)),
+            at(&(x2, y1 + tr - tr * K)),
+        );
+    }
+    builder.line_to(at(&(x2, y2 - br)));
+    if br > 0. {
+        builder.cubic_bezier_to(
+            at(&(x2 - br, y2)),
+            at(&(x2, y2 - br + br * K)),
+            at(&(x2 - br + br * K, y2)),
+        );
+    }
+    builder.line_to(at(&(x1 + bl, y2)));
+    if bl > 0. {
+        builder.cubic_bezier_to(
+            at(&(x1, y2 - bl)),
+            at(&(x1 + bl - bl * K, y2)),
+            at(&(x1, y2 - bl + bl * K)),
+        );
+    }
+    builder.line_to(at(&(x1, y1 + tl)));
+    if tl > 0. {
+        builder.cubic_bezier_to(
+            at(&(x1 + tl, y1)),
+            at(&(x1, y1 + tl - tl * K)),
+            at(&(x1 + tl - tl * K, y1)),
+        );
+    }
+    builder.close();
 }
