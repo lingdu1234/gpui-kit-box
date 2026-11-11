@@ -46,7 +46,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
+    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point,
 };
 
 use super::common::{clean_label, text_width};
@@ -756,7 +756,16 @@ fn text_on(fill: Hsla, bg: Hsla, fg: Hsla, dark: bool) -> Hsla {
     if flat_l > 0.6 { dark_text } else { light_text }
 }
 
-pub(super) fn render(chart: &GanttChart, cx: &App) -> AnyElement {
+/// 图的自然尺寸（未缩放），供等比适配包装计算缩放系数。
+pub(super) fn size(chart: &GanttChart) -> (f32, f32) {
+    let lay = layout(chart);
+    (lay.width, lay.height)
+}
+
+pub(super) fn render(chart: &GanttChart, scale: f32, cx: &App) -> AnyElement {
+    // 等比缩放：函数内所有 px 值（坐标、宽高、字号、线宽、行高）同乘 scale，
+    // 布局坐标不动，几何天然相似，不变形。scale=1 时与未缩放输出一致。
+    let px = move |v: f32| gpui_kit::px(v * scale);
     let pal = palette::of(cx);
     let dark = cx.theme().is_dark();
     let lay = layout(chart);

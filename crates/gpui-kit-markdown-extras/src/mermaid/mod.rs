@@ -36,6 +36,16 @@ use gpui_kit::{App, IntoElement, Window, div};
 
 mod common;
 
+// 等比适配包装：可用空间不足时整图同比例缩小（见 `fit.rs` 顶部说明）。
+#[cfg(any(
+    feature = "mermaid-flowchart",
+    feature = "mermaid-state",
+    feature = "mermaid-sequence",
+    feature = "mermaid-class",
+    feature = "mermaid-gantt"
+))]
+mod fit;
+
 // 图表配色的唯一来源：所有 Mermaid 图共用一套色阶（见 `palette.rs` 顶部说明）。
 // 「后续新增的图也必须从这里取色」由 `palette.rs` 的扫描测试守住。
 #[cfg(any(
@@ -111,13 +121,13 @@ fn fence_of_kind<'a>(node: &'a markdown_ast::Node, kind: &str) -> Option<&'a str
 // 两个「节点-连线」图的渲染入口：同一条绘制路径，只是观感参数不同。
 // 返回类型写全路径，避免只开 sequence/class/gantt 时 `AnyElement` 成为未使用导入。
 #[cfg(feature = "mermaid-flowchart")]
-fn render_flowchart(graph: &layout::Graph, cx: &App) -> gpui_kit::AnyElement {
-    node_link::render_node_link(graph, node_link::NodeLinkStyle::Flowchart, cx)
+fn render_flowchart(graph: &layout::Graph, scale: f32, cx: &App) -> gpui_kit::AnyElement {
+    node_link::render_node_link(graph, node_link::NodeLinkStyle::Flowchart, scale, cx)
 }
 
 #[cfg(feature = "mermaid-state")]
-fn render_state(graph: &layout::Graph, cx: &App) -> gpui_kit::AnyElement {
-    node_link::render_node_link(graph, node_link::NodeLinkStyle::State, cx)
+fn render_state(graph: &layout::Graph, scale: f32, cx: &App) -> gpui_kit::AnyElement {
+    node_link::render_node_link(graph, node_link::NodeLinkStyle::State, scale, cx)
 }
 
 /// 定义一个「只认某一类 Mermaid 围栏」的块级插件。
@@ -127,7 +137,8 @@ fn render_state(graph: &layout::Graph, cx: &App) -> gpui_kit::AnyElement {
 /// 即可，不需要再维护一个「按变体分发」的中心枚举。
 ///
 /// 参数依次是：插件类型名、feature、node 名、`diagram_kind` 关键字、解析产物
-/// 类型、解析函数、渲染函数（签名 `fn(&产物, &App) -> AnyElement`）。
+/// 类型、解析函数、自然尺寸函数（签名 `fn(&产物) -> (f32, f32)`）、渲染函数
+/// （签名 `fn(&产物, f32, &App) -> AnyElement`，第二个参数是等比缩放系数）。
 macro_rules! diagram_plugin {
     (
         $(#[$meta:meta])*
@@ -137,6 +148,7 @@ macro_rules! diagram_plugin {
         $kind:literal,
         $data:ty,
         $parse:path,
+        $size:path,
         $render:path
     ) => {
         $(#[$meta])*
@@ -190,10 +202,19 @@ macro_rules! diagram_plugin {
                 &self,
                 node: &MarkdownNode,
                 _window: &mut Window,
-                cx: &mut App,
+                _cx: &mut App,
             ) -> impl IntoElement {
                 match node.data::<$data>() {
-                    Some(data) => $render(data, cx),
+                    Some(data) => {
+                        // 宿主不告知可用宽高：套一层等比适配包装，由它在布局期
+                        // 测量父容器空间，不足时把整图（含文字）同比例缩小。
+                        let data = data.clone();
+                        let (w, h) = $size(&data);
+                        fit::FitDiagram::new(w, h, move |scale, _window, cx| {
+                            $render(&data, scale, cx)
+                        })
+                        .into_any_element()
+                    }
                     // 产物类型对不上（例如别的插件用了同名节点）时画空，不 panic。
                     None => div().into_any_element(),
                 }
@@ -210,6 +231,7 @@ diagram_plugin!(
     "flowchart",
     layout::Graph,
     flowchart::parse_graph,
+    node_link::node_link_size,
     render_flowchart
 );
 
@@ -221,6 +243,7 @@ diagram_plugin!(
     "sequence",
     sequence::Sequence,
     sequence::parse,
+    sequence::size,
     sequence::render
 );
 
@@ -232,6 +255,7 @@ diagram_plugin!(
     "class",
     class::ClassDiagram,
     class::parse,
+    class::size,
     class::render
 );
 
@@ -243,6 +267,7 @@ diagram_plugin!(
     "state",
     layout::Graph,
     state::parse,
+    node_link::node_link_size,
     render_state
 );
 
@@ -254,6 +279,7 @@ diagram_plugin!(
     "gantt",
     gantt::GanttChart,
     gantt::parse,
+    gantt::size,
     gantt::render
 );
 

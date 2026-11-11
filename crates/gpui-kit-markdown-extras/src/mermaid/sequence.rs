@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use gpui_kit::component::h_flex;
 use gpui_kit::{
-    AnyElement, App, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
+    AnyElement, App, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point,
 };
 
 use super::common::{clean_label, text_width};
@@ -758,7 +758,16 @@ fn bracket(label: &str) -> String {
 // 渲染
 // ---------------------------------------------------------------------------
 
-pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
+/// 图的自然尺寸（未缩放），供等比适配包装计算缩放系数。
+pub(super) fn size(seq: &Sequence) -> (f32, f32) {
+    let lay = layout(seq);
+    (lay.width, lay.height)
+}
+
+pub(super) fn render(seq: &Sequence, scale: f32, cx: &App) -> AnyElement {
+    // 等比缩放：函数内所有 px 值（坐标、宽高、字号、线宽、圆角）同乘 scale，
+    // 布局坐标不动，几何天然相似，不变形。scale=1 时与未缩放输出一致。
+    let px = move |v: f32| gpui_kit::px(v * scale);
     let pal = palette::of(cx);
     let lay = layout(seq);
 
@@ -976,12 +985,12 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                     .items_center()
                     .justify_center()
                     .rounded(px(6.))
-                    .border_1()
+                    .border(px(1.))
                     .border_color(pal.outline)
                     .bg(pal.surface)
                     .text_size(px(FONT))
                     .text_color(pal.text)
-                    .child(div().text_center().px_2().child(p.label.clone())),
+                    .child(div().text_center().px(px(8.)).child(p.label.clone())),
             );
         }
     }
@@ -1049,7 +1058,7 @@ pub(super) fn render(seq: &Sequence, cx: &App) -> AnyElement {
                 .items_center()
                 .justify_center()
                 .rounded(px(8.))
-                .border_1()
+                .border(px(1.))
                 .border_color(pal.outline)
                 .bg(pal.background)
                 .text_size(px(9.))

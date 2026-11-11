@@ -15,7 +15,7 @@
 
 use gpui_kit::component::h_flex;
 use gpui_kit::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point, px,
+    AnyElement, App, Hsla, IntoElement, ParentElement, PathBuilder, Styled, canvas, div, point,
 };
 
 use super::common::{rounded_elbow, rounded_rect};
@@ -115,7 +115,91 @@ fn member_label(label: &str) -> &str {
     label.rsplit("::").next().unwrap_or(label)
 }
 
-pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) -> AnyElement {
+/// 图的自然尺寸（未缩放）：布局尺寸 + 右侧注释 / 外框可能探出的部分。
+/// 供等比适配包装在布局期计算缩放系数。
+pub(super) fn node_link_size(graph: &Graph) -> (f32, f32) {
+    let lay = layout(graph);
+    let notes = place_notes(graph, &lay);
+    canvas_size(&lay, &notes)
+}
+
+/// 注释落位：默认贴节点右侧，那一格被别的节点占了就退到整张图右边。
+fn place_notes(graph: &Graph, layout: &Layout) -> Vec<Note> {
+    // 图的右边界：注释默认贴在节点右侧，那一格被别的节点占了就退到整张图右边，
+    // 否则两个框会叠在一起（订单状态机里 Paid 右边的 Failed 就是这种情况）。
+    let graph_right = layout
+        .nodes
+        .iter()
+        .map(|p| p.x + p.w)
+        .chain(layout.overlays.iter().map(|(_, _, x2, _, _)| *x2))
+        .fold(0., f32::max);
+    graph
+        .notes
+        .iter()
+        .map(|(ix, text)| {
+            let p = layout.nodes[*ix];
+            let w = estimate_width(text, 11.) + 20.;
+            let mut x = p.x + p.w + 16.;
+            let mut y = p.y;
+            let clash = layout.nodes.iter().enumerate().any(|(j, q)| {
+                j != *ix && q.x < x + w && q.x + q.w > x && q.y < p.y + NODE_H && q.y + NODE_H > p.y
+            });
+            let link = if clash {
+                // 右边那一格已经被别的状态占了：退到整张图右边、并下移半行，
+                // 引线从锚点右下角兜下去，才不会看起来像连着隔壁那个状态。
+                x = graph_right + 24.;
+                y = p.y + NODE_H + 22.;
+                let to = (x, y + NOTE_H / 2.);
+                NoteLink {
+                    from: (p.x + p.w, p.y + NODE_H),
+                    c1: (p.x + p.w + 34., p.y + NODE_H + 26.),
+                    c2: (to.0 - 44., to.1),
+                    to,
+                }
+            } else {
+                let to = (x, y + NOTE_H / 2.);
+                NoteLink {
+                    from: (p.x + p.w, p.y + NODE_H / 2.),
+                    c1: (p.x + p.w + 6., to.1),
+                    c2: (to.0 - 8., to.1),
+                    to,
+                }
+            };
+            Note {
+                x,
+                y,
+                text: text.clone(),
+                link,
+            }
+        })
+        .collect()
+}
+
+/// 自然尺寸：右侧注释与复合状态外框可能探出布局宽高，容器要跟着变宽变高。
+fn canvas_size(layout: &Layout, notes: &[Note]) -> (f32, f32) {
+    let mut width = layout.width;
+    let mut height = layout.height;
+    for note in notes {
+        width = width.max(note.x + estimate_width(&note.text, 11.) + 24.);
+        height = height.max(note.y + NOTE_H);
+    }
+    for (_, _, x2, y2, _) in &layout.overlays {
+        width = width.max(*x2 + PAD);
+        height = height.max(*y2 + PAD);
+    }
+    (width, height)
+}
+
+pub(super) fn render_node_link(
+    graph: &Graph,
+    style: NodeLinkStyle,
+    scale: f32,
+    cx: &App,
+) -> AnyElement {
+    // 等比缩放：函数内所有 px 值（坐标、宽高、字号、线宽、圆角）同乘 scale。
+    // 布局坐标本身不动，canvas 的 `at` 映射与文字 div 都经过这个 px，
+    // 几何天然相似，不变形。scale=1 时与未缩放输出逐像素一致。
+    let px = move |v: f32| gpui_kit::px(v * scale);
     let state = style == NodeLinkStyle::State;
     let pal = palette::of(cx);
     let look = Style::new(state, &pal);
@@ -176,54 +260,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
 
     // 复合状态外框矩形在布局层算好（布线的贴边锚点也依赖它），这里直接用。
     let overlays = layout.overlays.clone();
-    // 图的右边界：注释默认贴在节点右侧，那一格被别的节点占了就退到整张图右边，
-    // 否则两个框会叠在一起（订单状态机里 Paid 右边的 Failed 就是这种情况）。
-    let graph_right = layout
-        .nodes
-        .iter()
-        .map(|p| p.x + p.w)
-        .chain(overlays.iter().map(|(_, _, x2, _, _)| *x2))
-        .fold(0., f32::max);
-    let notes: Vec<Note> = graph
-        .notes
-        .iter()
-        .map(|(ix, text)| {
-            let p = layout.nodes[*ix];
-            let w = estimate_width(text, 11.) + 20.;
-            let mut x = p.x + p.w + 16.;
-            let mut y = p.y;
-            let clash = layout.nodes.iter().enumerate().any(|(j, q)| {
-                j != *ix && q.x < x + w && q.x + q.w > x && q.y < p.y + NODE_H && q.y + NODE_H > p.y
-            });
-            let link = if clash {
-                // 右边那一格已经被别的状态占了：退到整张图右边、并下移半行，
-                // 引线从锚点右下角兜下去，才不会看起来像连着隔壁那个状态。
-                x = graph_right + 24.;
-                y = p.y + NODE_H + 22.;
-                let to = (x, y + NOTE_H / 2.);
-                NoteLink {
-                    from: (p.x + p.w, p.y + NODE_H),
-                    c1: (p.x + p.w + 34., p.y + NODE_H + 26.),
-                    c2: (to.0 - 44., to.1),
-                    to,
-                }
-            } else {
-                let to = (x, y + NOTE_H / 2.);
-                NoteLink {
-                    from: (p.x + p.w, p.y + NODE_H / 2.),
-                    c1: (p.x + p.w + 6., to.1),
-                    c2: (to.0 - 8., to.1),
-                    to,
-                }
-            };
-            Note {
-                x,
-                y,
-                text: text.clone(),
-                link,
-            }
-        })
-        .collect();
+    let notes = place_notes(graph, &layout);
 
     let paint_overlays = overlays.clone();
     let paint_notes = notes.clone();
@@ -586,17 +623,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
     .absolute()
     .inset_0();
 
-    // 右侧注释与复合状态外框可能探出布局宽度，容器要跟着变宽变高。
-    let mut canvas_width = layout.width;
-    let mut canvas_height = layout.height;
-    for note in &notes {
-        canvas_width = canvas_width.max(note.x + estimate_width(&note.text, 11.) + 24.);
-        canvas_height = canvas_height.max(note.y + NOTE_H);
-    }
-    for (_, _, x2, y2, _) in &overlays {
-        canvas_width = canvas_width.max(*x2 + PAD);
-        canvas_height = canvas_height.max(*y2 + PAD);
-    }
+    let (canvas_width, canvas_height) = canvas_size(&layout, &notes);
 
     let mut container = div()
         .relative()
@@ -635,7 +662,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                     .items_center()
                     .justify_center()
                     .text_size(px(FONT))
-                    .child(div().text_center().px_1().child(label.to_string())),
+                    .child(div().text_center().px(px(4.)).child(label.to_string())),
             );
             continue;
         }
@@ -670,7 +697,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                     .items_center()
                     .justify_center()
                     .text_size(px(FONT))
-                    .child(div().text_center().px_1().child(label.to_string())),
+                    .child(div().text_center().px(px(4.)).child(label.to_string())),
             );
             continue;
         }
@@ -695,12 +722,12 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                 .justify_center()
                 .overflow_hidden()
                 .rounded(radius)
-                .border_1()
+                .border(px(1.))
                 .border_color(pal.outline)
                 .bg(look.node_fill)
                 .text_size(px(FONT))
                 .text_color(pal.text)
-                .child(div().text_center().px_2().child(label.to_string())),
+                .child(div().text_center().px(px(8.)).child(label.to_string())),
         );
     }
 
@@ -732,7 +759,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                 .items_center()
                 .justify_center()
                 .rounded(px(4.))
-                .border_1()
+                .border(px(1.))
                 .border_color(pal.note_outline)
                 .bg(pal.note_fill)
                 .text_size(px(11.))
