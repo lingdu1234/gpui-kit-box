@@ -10,8 +10,8 @@ A Rust desktop UI workspace built on [gpui-kit](https://crates.io/crates/gpui-ki
 
 | Crate | Type | Description |
 |---|---|---|
-| `gpui-kit-box` | binary (app framework) | Base framework / scaffold for gpui-kit programs, for quickly building desktop apps; used here as a demo app with a single Markdown doc page showcasing math and five diagram types: flowchart, sequenceDiagram, classDiagram, stateDiagram-v2 and gantt. |
-| `gpui-kit-markdown-extras` | library | Markdown extension plugins for `gpui-kit`'s `TextView`: `$…$` / `$$…$$` math and five `mermaid` diagram types, enabled per Cargo feature. To be published to crates.io. |
+| `gpui-kit-box` | binary (app framework) | Base framework / scaffold for gpui-kit programs, for quickly building desktop apps; used here as a demo app with per-diagram Markdown example pages showcasing math and five diagram types: flowchart, sequenceDiagram, classDiagram, stateDiagram-v2 and gantt. |
+| `gpui-kit-markdown-extras` | library | Markdown extension plugins for `gpui-kit`'s `TextView`: `$…$` / `$$…$$` math and five `mermaid` diagram types, enabled per Cargo feature. Published on crates.io: <https://crates.io/crates/gpui-kit-markdown-extras> |
 
 See each crate's `README.md` / `README.en.md`:
 

@@ -11,7 +11,7 @@
 | Crate | 类型 | 说明 |
 |---|---|---|
 | `gpui-kit-box` | 二进制（应用框架） | gpui-kit 程序的基础框架 / 脚手架，用于快速构建桌面应用；本仓库中作为演示程序，按图表类型拆分 Markdown 示例页，展示公式与 flowchart / sequenceDiagram / classDiagram / stateDiagram-v2 / gantt 五类图渲染。 |
-| `gpui-kit-markdown-extras` | 库 | 为 `gpui-kit` 的 `TextView` 提供 Markdown 扩展插件：`$…$` / `$$…$$` 数学公式与五类 `mermaid` 图表；能力按 Cargo feature 按需启用。计划发布至 crates.io。 |
+| `gpui-kit-markdown-extras` | 库 | 为 `gpui-kit` 的 `TextView` 提供 Markdown 扩展插件：`$…$` / `$$…$$` 数学公式与五类 `mermaid` 图表；能力按 Cargo feature 按需启用。已发布至 crates.io：<https://crates.io/crates/gpui-kit-markdown-extras> |
 
 详见各 crate 目录下的 `README.md` / `README.en.md`：
 

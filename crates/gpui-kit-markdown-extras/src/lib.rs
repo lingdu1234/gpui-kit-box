@@ -32,7 +32,7 @@
 //! 本 crate 的 `default` 为**空**，什么都不启用；按需在依赖声明里打开：
 //!
 //! ```toml
-//! gpui-kit-markdown-extras = { version = "0.2", default-features = false,
+//! gpui-kit-markdown-extras = { version = "0.3", default-features = false,
 //!                              features = ["math", "mermaid-sequence", "mermaid-gantt"] }
 //! ```
 //!
