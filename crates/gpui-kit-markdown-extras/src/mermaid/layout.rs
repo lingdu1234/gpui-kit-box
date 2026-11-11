@@ -34,20 +34,122 @@ pub(super) const LANE_W: f32 = 42.;
 pub(super) const LANE_MARGIN: f32 = 38.;
 pub(super) const MIN_W: f32 = 152.;
 pub(super) const MAX_W: f32 = 300.;
-/// 指向目标框底部的箭头（回退边从下方收进去）。
-fn arrow_up(tx: f32, ty: f32) -> [(f32, f32); 3] {
-    [(tx - 5., ty + 10.), (tx + 5., ty + 10.), (tx, ty)]
+/// 连线样式：`-->` 实线、`-.->` 虚线、`==>` 粗线。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EdgeStyle {
+    Solid,
+    Dotted,
+    Thick,
 }
 
-/// 指向目标框顶部的箭头（正向边与长边的收尾一致）。
-fn arrow_down(tx: f32, ty: f32) -> [(f32, f32); 3] {
-    [(tx - 5., ty - 10.), (tx + 5., ty - 10.), (tx, ty)]
+/// 连线端点的符号：无（`---`）、三角箭头（`-->`）、圆圈（`--o`）、叉（`--x`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EdgeEnd {
+    Bare,
+    Arrow,
+    Circle,
+    Cross,
 }
-#[derive(Clone, Copy, PartialEq)]
+
+fn unit(v: (f32, f32)) -> (f32, f32) {
+    let len = (v.0 * v.0 + v.1 * v.1).sqrt().max(1e-4);
+    (v.0 / len, v.1 / len)
+}
+
+fn sub(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    (a.0 - b.0, a.1 - b.1)
+}
+
+/// 沿来向 `dir` 收进 `end` 的三角箭头：尖角落在 `end`，底边退后 10px。
+/// 竖直来向下正好复刻原先的 arrow_down / arrow_up，斜向与水平来向也能正确定向。
+fn head_triangle(end: (f32, f32), dir: (f32, f32)) -> [(f32, f32); 3] {
+    let (dx, dy) = unit(dir);
+    let (bx, by) = (end.0 - dx * 10., end.1 - dy * 10.);
+    [(bx - dy * 5., by + dx * 5.), (bx + dy * 5., by - dx * 5.), end]
+}
+
+/// 路径的起止点与两端行进方向：`(start, dir_start, end, dir_end)`。
+/// 方向用于给 `--o` / `--x` / `<-->` 的端点符号定向。
+fn path_endpoints(path: &EdgePath) -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32)) {
+    match path {
+        EdgePath::Curve { p0, c1, c2, p3 } => (*p0, unit(sub(*c1, *p0)), *p3, unit(sub(*p3, *c2))),
+        EdgePath::Elbow { points, .. } => {
+            let n = points.len();
+            if n < 2 {
+                let p = points.first().copied().unwrap_or((0., 0.));
+                return (p, (0., 1.), p, (0., 1.));
+            }
+            (points[0], unit(sub(points[1], points[0])), points[n - 1], unit(sub(points[n - 1], points[n - 2])))
+        }
+    }
+}
+
+/// 按端点符号补齐箭头三角与圆圈/叉记号，收尾所有 EdgeLine 的构造。
+fn finish_line(
+    path: EdgePath,
+    style: EdgeStyle,
+    left: EdgeEnd,
+    right: EdgeEnd,
+    label: Option<(f32, f32, String)>,
+) -> EdgeLine {
+    let (start, d0, end, d1) = path_endpoints(&path);
+    let head = (right == EdgeEnd::Arrow).then(|| head_triangle(end, d1));
+    // `<-->`：左端也有三角，尖角指向源节点。
+    let left_head = (left == EdgeEnd::Arrow).then(|| head_triangle(start, unit(sub((0., 0.), d0))));
+    let marks = [
+        (left == EdgeEnd::Circle || left == EdgeEnd::Cross).then_some((start.0, start.1, left)),
+        (right == EdgeEnd::Circle || right == EdgeEnd::Cross).then_some((end.0, end.1, right)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    EdgeLine {
+        path,
+        head,
+        left_head,
+        marks,
+        label,
+        style,
+    }
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Shape {
     Rect,
     Round,
     Diamond,
+    /// `([药丸])`：全圆角胶囊。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Stadium,
+    /// `((圆))`：正圆。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Circle,
+    /// `(((双圆)))`：同心双圈。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    DoubleCircle,
+    /// `[(圆柱)]`：数据库。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Database,
+    /// `[[子程序]]`：左右双竖线。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Subroutine,
+    /// `{{六边形}}`。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Hexagon,
+    /// `[/平行四边形/]`：上边右移。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Para,
+    /// `[\\反平行四边形\\]`：上边左移。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    ParaAlt,
+    /// `[/梯形\\]`：上窄下宽。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Trap,
+    /// `[\\反梯形/]`：上宽下窄。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    TrapAlt,
+    /// `>旗形]`：右侧尖角。
+    #[cfg_attr(not(feature = "mermaid-flowchart"), allow(dead_code))]
+    Flag,
     /// 状态图 `[*]`：实心圆 + 外环。
     #[cfg_attr(not(feature = "mermaid-state"), allow(dead_code))]
     Terminal,
@@ -56,12 +158,13 @@ pub(super) enum Shape {
     Bar,
 }
 
-/// 复合状态的外框。`anchor` 是复合状态自身的节点：对外转移都连在它上面，
-/// 布局时它留在主链里，内部成员由虚拟边钉到它的正下方，外框按成员包围盒描边。
+/// 外框：复合状态（`anchor` = 框自身的锚点节点）与流程图子图（`anchor` = None，
+/// 纯视觉分组）共用。成员包围盒外扩一圈描边。
 #[derive(Clone)]
 pub(super) struct Overlay {
     pub(super) label: String,
-    pub(super) anchor: usize,
+    /// 复合状态锚点；子图没有锚点。
+    pub(super) anchor: Option<usize>,
     pub(super) members: Vec<usize>,
 }
 
@@ -78,13 +181,28 @@ pub(super) struct GraphEdge {
     pub(super) label: Option<String>,
     /// 指向已排在前面的层：画成右侧回边通道。
     pub(super) back: bool,
+    /// 实线 / 虚线 / 粗线（`-.->` / `==>`）。
+    pub(super) style: EdgeStyle,
+    /// 两端的端点符号（`--o` / `--x` / `<-->`）。
+    pub(super) left: EdgeEnd,
+    pub(super) right: EdgeEnd,
+    /// 端点连在子图外框上时记录框的序号；此时 from/to 是占位的 0。
+    pub(super) from_sg: Option<usize>,
+    pub(super) to_sg: Option<usize>,
+}
+
+impl GraphEdge {
+    /// 子图框边：端点连在子图外框上，不参与分层，节点落位后单独锚到框边。
+    pub(super) fn is_frame(&self) -> bool {
+        self.from_sg.is_some() || self.to_sg.is_some()
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct Graph {
     pub(super) nodes: Vec<GraphNode>,
     pub(super) edges: Vec<GraphEdge>,
-    /// 复合状态外框（flowchart 恒为空）。
+    /// 复合状态外框（状态图）与子图外框（flowchart）。
     pub(super) overlays: Vec<Overlay>,
     /// 复合状态的虚拟约束边 `(锚点, 内部根节点)`：只参与分层与列对齐，不绘制。
     pub(super) pin_edges: Vec<(usize, usize)>,
@@ -97,9 +215,13 @@ pub(super) struct Graph {
 // ---------------------------------------------------------------------------
 
 /// DFS 标出回边：指向「当前还在递归栈里」的节点的边。
+/// 子图框边（端点是外框不是节点）不参与。
 pub(super) fn mark_back_edges(edges: &mut [GraphEdge], count: usize) {
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); count];
     for (ix, edge) in edges.iter().enumerate() {
+        if edge.is_frame() {
+            continue;
+        }
         adjacency[edge.from].push(ix);
     }
     let mut color = vec![0u8; count];
@@ -144,10 +266,17 @@ pub(super) struct Placed {
     pub(super) w: f32,
 }
 
+#[derive(Clone)]
 pub(super) struct EdgeLine {
     pub(super) path: EdgePath,
-    pub(super) head: [(f32, f32); 3],
+    /// 右端是三角箭头时才有值（`---` / `--o` 等没有）。
+    pub(super) head: Option<[(f32, f32); 3]>,
+    /// 左端是三角箭头时才有值（`<-->`）。
+    pub(super) left_head: Option<[(f32, f32); 3]>,
+    /// 两端的圆圈 / 叉记号。
+    pub(super) marks: Vec<(f32, f32, EdgeEnd)>,
     pub(super) label: Option<(f32, f32, String)>,
+    pub(super) style: EdgeStyle,
 }
 
 #[derive(Clone, Debug)]
@@ -388,10 +517,12 @@ fn blocked_between(
 pub(super) fn layout(graph: &Graph) -> Layout {
     let count = graph.nodes.len();
 
-    // 锚点 → 复合状态的桥：进出锚点的连线要贴外框顶/底边。
+    // 锚点 → 复合状态的桥：进出锚点的连线要贴外框顶/底边。子图没有锚点。
     let mut anchor_ov: Vec<Option<usize>> = vec![None; count];
     for (oi, ov) in graph.overlays.iter().enumerate() {
-        anchor_ov[ov.anchor] = Some(oi);
+        if let Some(anchor) = ov.anchor {
+            anchor_ov[anchor] = Some(oi);
+        }
     }
 
     // 分层：只走非回边，最长路径。回边已经排除，所以不会死循环。
@@ -405,7 +536,7 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     let mut rank = vec![0usize; count];
     for _ in 0..count {
         let mut changed = false;
-        for edge in graph.edges.iter().filter(|edge| !edge.back) {
+        for edge in graph.edges.iter().filter(|edge| !edge.back && !edge.is_frame()) {
             relax(&mut rank, edge.from, edge.to, 1, &mut changed);
         }
         for &(from, to) in graph.pin_edges.iter() {
@@ -420,26 +551,54 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     // 否则线会从框中间穿出去（旧实现的 Running --> check 正是这样）。
     let mut anchor_outs: Vec<(usize, usize, usize)> = Vec::new();
     for ov in &graph.overlays {
+        let Some(anchor) = ov.anchor else { continue; };
         let span = ov
             .members
             .iter()
-            .filter(|&&m| m != ov.anchor)
-            .map(|&m| rank[m].saturating_sub(rank[ov.anchor]))
+            .filter(|&&m| m != anchor)
+            .map(|&m| rank[m].saturating_sub(rank[anchor]))
             .max()
             .unwrap_or(0);
         for edge in graph
             .edges
             .iter()
-            .filter(|edge| !edge.back && edge.from == ov.anchor)
+            .filter(|edge| !edge.back && edge.from == anchor)
         {
             if !ov.members.contains(&edge.to) {
-                anchor_outs.push((ov.anchor, edge.to, span + 1));
+                anchor_outs.push((anchor, edge.to, span + 1));
             }
+        }
+    }
+    // 子图框边把整组成员和外部节点钉在相邻层：节点 → 子图时所有成员都在
+    // 来源节点之下，子图 → 节点时目标节点在所有成员之下，子图 → 子图时
+    // 目标整组在来源整组之下。这样外框不会罩到外部节头上，两框也不会叠行。
+    for edge in graph.edges.iter().filter(|edge| edge.is_frame()) {
+        match (edge.from_sg, edge.to_sg) {
+            (None, Some(sg)) => {
+                for &m in &graph.overlays[sg].members {
+                    anchor_outs.push((edge.from, m, 1));
+                }
+            }
+            (Some(sg), None) => {
+                for &m in &graph.overlays[sg].members {
+                    anchor_outs.push((m, edge.to, 1));
+                }
+            }
+            (Some(from_sg), Some(to_sg)) => {
+                let src = &graph.overlays[from_sg].members;
+                let dst = &graph.overlays[to_sg].members;
+                for &s in src {
+                    for &m in dst {
+                        anchor_outs.push((s, m, 1));
+                    }
+                }
+            }
+            (None, None) => {}
         }
     }
     for _ in 0..count {
         let mut changed = false;
-        for edge in graph.edges.iter().filter(|edge| !edge.back) {
+        for edge in graph.edges.iter().filter(|edge| !edge.back && !edge.is_frame()) {
             relax(&mut rank, edge.from, edge.to, 1, &mut changed);
         }
         for &(from, to) in graph.pin_edges.iter() {
@@ -456,16 +615,25 @@ pub(super) fn layout(graph: &Graph) -> Layout {
 
     // 向上或同层的边（除 DFS 回边外，还有「循环里跳回上层」这种回退边）同样要走侧通道：
     // 直着连会往回画成一条被压扁的曲线，而且会穿过中间的行。
+    // 子图框边不进任何布线机械——它不连节点，节点落位后单独贴框画。
     let escaping: Vec<bool> = graph
         .edges
         .iter()
-        .map(|edge| edge.back || rank[edge.to] <= rank[edge.from])
+        .map(|edge| edge.back || edge.is_frame() || rank[edge.to] <= rank[edge.from])
         .collect();
 
     let widths: Vec<f32> = graph
         .nodes
         .iter()
-        .map(|node| (estimate_width(&node.label, FONT) + 30.).clamp(MIN_W, MAX_W))
+        .map(|node| {
+            // 圆 / 药丸按文字收窄，别让一个两字的圆占满 152px。
+            let (min, max) = match node.shape {
+                Shape::Circle | Shape::DoubleCircle => (96., 190.),
+                Shape::Stadium => (110., MAX_W),
+                _ => (MIN_W, MAX_W),
+            };
+            (estimate_width(&node.label, FONT) + 30.).clamp(min, max)
+        })
         .collect();
 
     // ---- 层内顺序：重心法交叉最小化 ----
@@ -517,12 +685,12 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         let in_deg = graph
             .edges
             .iter()
-            .filter(|e| e.to == node && !e.back)
+            .filter(|e| e.to == node && !e.back && !e.is_frame())
             .count();
         let outs: Vec<f32> = graph
             .edges
             .iter()
-            .filter(|edge| edge.from == node && !edge.back)
+            .filter(|edge| edge.from == node && !edge.back && !edge.is_frame())
             .map(|edge| pos[edge.to] + widths[edge.to] / 2.)
             .collect();
         let aligns = (in_deg <= 1 && outs.len() >= 2) || (in_deg == 0 && !outs.is_empty());
@@ -555,13 +723,9 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     // 这一行改成从锚点行顶只让出标题栏 + 呼吸，外框也随之内收。
     let mut below_anchor = vec![false; depth];
     for ov in &graph.overlays {
-        let row = rank[ov.anchor] + 1;
-        if row < depth
-            && ov
-                .members
-                .iter()
-                .any(|&m| m != ov.anchor && rank[m] == row)
-        {
+        let Some(anchor) = ov.anchor else { continue; };
+        let row = rank[anchor] + 1;
+        if row < depth && ov.members.iter().any(|&m| m != anchor && rank[m] == row) {
             below_anchor[row] = true;
         }
     }
@@ -617,6 +781,10 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     let mut detours: Vec<usize> = (0..graph.edges.len())
         .filter(|&ix| {
             let edge = &graph.edges[ix];
+            // 子图框边不绕通道：它没有节点端，落位后单独贴框画。
+            if edge.is_frame() {
+                return false;
+            }
             // 复合状态的出边从外框底边出发（见 shape_y 的锚点分支），
             // 不会擦到框内成员，按锚点自身的位置做穿框检测只会误判。
             if anchor_ov[edge.from].is_some() {
@@ -718,10 +886,12 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     }
     let height = row_y[depth - 1] + NODE_H + PAD;
 
-    // 复合状态外框：成员（含锚点）包围盒外扩一圈，顶部留标题的空间；
-    // 锚点位于最顶层时不要再探出画布。
-    let mut overlays: Vec<(f32, f32, f32, f32, String)> = Vec::with_capacity(graph.overlays.len());
-    for ov in &graph.overlays {
+    // 外框：成员包围盒外扩一圈，顶部留标题的空间；锚点位于最顶层时不要再
+    // 探出画布。空成员（空 subgraph）没有框，占位 None，保持与 graph.overlays
+    // 的下标对齐，框边才能按序号查到自己的框。
+    let mut ov_rects: Vec<Option<(f32, f32, f32, f32, String)>> =
+        graph.overlays.iter().map(|_| None).collect();
+    for (oi, ov) in graph.overlays.iter().enumerate() {
         let mut bounds: Option<(f32, f32, f32, f32)> = None;
         for &ix in &ov.members {
             let p = nodes[ix];
@@ -732,7 +902,7 @@ pub(super) fn layout(graph: &Graph) -> Layout {
             });
         }
         if let Some((x1, y1, x2, y2)) = bounds {
-            overlays.push((
+            ov_rects[oi] = Some((
                 x1 - 26.,
                 (y1 - OVERLAY_TOP).max(2.),
                 x2 + 26.,
@@ -741,34 +911,60 @@ pub(super) fn layout(graph: &Graph) -> Layout {
             ));
         }
     }
+    let overlays: Vec<(f32, f32, f32, f32, String)> =
+        ov_rects.iter().flatten().cloned().collect();
 
     let center = |ix: usize| nodes[ix].x + nodes[ix].w / 2.;
+    // 排序键取「目标 / 源端」的中心：框边按其外框的中心参与排序，
+    // 占位端 0 的中心没有意义。
+    let end_center_x = |ix: usize, from_side: bool| -> f32 {
+        let edge = &graph.edges[ix];
+        let (sg, node) = if from_side {
+            (edge.from_sg, edge.from)
+        } else {
+            (edge.to_sg, edge.to)
+        };
+        if let Some(sg) = sg
+            && let Some((x1, _, x2, _, _)) = ov_rects[sg]
+        {
+            return (x1 + x2) / 2.;
+        }
+        center(node)
+    };
     let by_target = |a: &usize, b: &usize| {
-        center(graph.edges[*a].to)
-            .partial_cmp(&center(graph.edges[*b].to))
+        end_center_x(*a, false)
+            .partial_cmp(&end_center_x(*b, false))
             .unwrap_or(std::cmp::Ordering::Equal)
     };
     let by_source = |a: &usize, b: &usize| {
-        center(graph.edges[*a].from)
-            .partial_cmp(&center(graph.edges[*b].from))
+        end_center_x(*a, true)
+            .partial_cmp(&end_center_x(*b, true))
             .unwrap_or(std::cmp::Ordering::Equal)
     };
 
     // 同一个源的多条出边在框底均匀分开，各自独立成线。
     // 侧通道的边也参与分配出口，否则它会和普通边共用同一个点，箭头叠在一起。
+    // 框边只有真实节点的那一端参与分摊（占位端 0 不占任何节点的进出点）。
     let mut exits: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut entries: Vec<Vec<usize>> = vec![Vec::new(); count];
     for (ix, edge) in graph.edges.iter().enumerate() {
+        if edge.is_frame() {
+            if edge.from_sg.is_none() {
+                exits[edge.from].push(ix);
+            }
+            if edge.to_sg.is_none() {
+                entries[edge.to].push(ix);
+            }
+            continue;
+        }
         exits[edge.from].push(ix);
+        entries[edge.to].push(ix);
     }
     for list in &mut exits {
         list.sort_by(by_target);
     }
 
     // 同一个目标的入边按来源从左到右排，入点依次错开。
-    let mut entries: Vec<Vec<usize>> = vec![Vec::new(); count];
-    for (ix, edge) in graph.edges.iter().enumerate() {
-        entries[edge.to].push(ix);
-    }
     for list in &mut entries {
         list.sort_by(by_source);
     }
@@ -814,11 +1010,209 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         }
     };
 
+    // ---- 子图框边：节点落位后贴外框画 ----
+    // 框端朝向「另一端在哪侧就贴哪条边」，同一框同一条边上的多条框边
+    // 按另一端位置排序后沿框边均分；节点端按朝向贴上/下边（横向时贴侧边
+    // 中点），与普通边共用进出点分摊。两端锚点定好后连一条主轴 0.45 的
+    // S 曲线，跟相邻层的普通曲线一个画法。
+    let center_of =
+        |node: usize| (nodes[node].x + nodes[node].w / 2., nodes[node].y + NODE_H / 2.);
+    let end_center = |ix: usize, is_from: bool| -> Option<(f32, f32)> {
+        let edge = &graph.edges[ix];
+        let (sg, node) = if is_from {
+            (edge.from_sg, edge.from)
+        } else {
+            (edge.to_sg, edge.to)
+        };
+        match sg {
+            Some(sg) => ov_rects[sg]
+                .as_ref()
+                .map(|(x1, y1, x2, y2, _)| ((x1 + x2) / 2., (y1 + y2) / 2.)),
+            None => Some(center_of(node)),
+        }
+    };
+    // 面向另一端的那条边：0=顶 1=底 2=左 3=右。框外按归一化张角选顶底或
+    // 左右；另一端在框内（成员指向自己所在子图）时贴最近的一条边。
+    let facing = |rect: (f32, f32, f32, f32), other: (f32, f32)| -> u8 {
+        let (x1, y1, x2, y2) = rect;
+        let cx = (x1 + x2) / 2.;
+        let cy = (y1 + y2) / 2.;
+        if other.0 > x1 && other.0 < x2 && other.1 > y1 && other.1 < y2 {
+            let dists = [other.1 - y1, y2 - other.1, other.0 - x1, x2 - other.0];
+            return dists
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u8)
+                .unwrap_or(0);
+        }
+        let (dx, dy) = (other.0 - cx, other.1 - cy);
+        if dy.abs() * (x2 - x1) >= dx.abs() * (y2 - y1) {
+            if dy < 0. { 0 } else { 1 }
+        } else if dx < 0. {
+            2
+        } else {
+            3
+        }
+    };
+    let mut node_pts: HashMap<(usize, bool), (f32, f32)> = HashMap::new();
+    let mut groups: HashMap<(usize, u8), Vec<(usize, bool)>> = HashMap::new();
+    let mut frame_list: Vec<usize> = Vec::new();
+    for (ix, edge) in graph.edges.iter().enumerate() {
+        if !edge.is_frame() {
+            continue;
+        }
+        frame_list.push(ix);
+        for is_from in [true, false] {
+            let (sg, node) = if is_from {
+                (edge.from_sg, edge.from)
+            } else {
+                (edge.to_sg, edge.to)
+            };
+            if let Some(sg) = sg {
+                if let (Some(rect), Some(other)) = (
+                    ov_rects[sg].as_ref().map(|(x1, y1, x2, y2, _)| (*x1, *y1, *x2, *y2)),
+                    end_center(ix, !is_from),
+                ) {
+                    let side = facing(rect, other);
+                    groups.entry((sg, side)).or_default().push((ix, is_from));
+                }
+            } else {
+                let side = end_center(ix, !is_from).map(|other| {
+                    let placed = &nodes[node];
+                    let (nx, ny) = center_of(node);
+                    let (dx, dy) = (other.0 - nx, other.1 - ny);
+                    if dy.abs() * placed.w >= dx.abs() * NODE_H {
+                        if dy < 0. { 0 } else { 1 }
+                    } else if dx < 0. {
+                        2
+                    } else {
+                        3
+                    }
+                });
+                // 上/下边走进出点分摊，与普通边不叠在同一个点上。
+                let pt = side.map(|side| match side {
+                    2 => (nodes[node].x, nodes[node].y + NODE_H / 2.),
+                    3 => (nodes[node].x + nodes[node].w, nodes[node].y + NODE_H / 2.),
+                    _ => {
+                        let list = if is_from { &exits[node] } else { &entries[node] };
+                        let x = anchor_x(node, spread(slot_of(list, ix), list.len()));
+                        (x, shape_y(node, x, side == 0))
+                    }
+                });
+                if let Some(pt) = pt {
+                    node_pts.insert((ix, is_from), pt);
+                }
+            }
+        }
+    }
+    let mut frame_pts: HashMap<(usize, bool), (f32, f32)> = HashMap::new();
+    for ((sg, side), mut list) in groups {
+        let Some((x1, y1, x2, y2, _)) = ov_rects[sg] else {
+            continue;
+        };
+        // 组内按另一端沿框边方向的位置排序：靠左来的收在框边靠左的位置，
+        // 线与线不会在框边前互相交叉。
+        list.sort_by(|a, b| {
+            let key = |end: &(usize, bool)| {
+                end_center(end.0, !end.1)
+                    .map(|c| if side >= 2 { c.1 } else { c.0 })
+                    .unwrap_or(0.)
+            };
+            key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let n = list.len() as f32;
+        for (slot, &(ix, is_from)) in list.iter().enumerate() {
+            let f = (slot as f32 + 1.) / (n + 1.);
+            let pt = match side {
+                0 => (x1 + 24. + f * (x2 - x1 - 48.), y1),
+                1 => (x1 + 24. + f * (x2 - x1 - 48.), y2),
+                2 => (x1, y1 + 16. + f * (y2 - y1 - 32.)),
+                _ => (x2, y1 + 16. + f * (y2 - y1 - 32.)),
+            };
+            frame_pts.insert((ix, is_from), pt);
+        }
+    }
+    let mut frame_lines: HashMap<usize, EdgeLine> = HashMap::new();
+    for &ix in &frame_list {
+        let edge = &graph.edges[ix];
+        let mut anchors: [(f32, f32); 2] = [(0., 0.); 2];
+        let mut ok = true;
+        for (k, is_from) in [(0usize, true), (1usize, false)] {
+            let sg = if is_from {
+                edge.from_sg
+            } else {
+                edge.to_sg
+            };
+            let pt = if sg.is_some() {
+                frame_pts.get(&(ix, is_from)).copied()
+            } else {
+                node_pts.get(&(ix, is_from)).copied()
+            };
+            match pt {
+                Some(pt) => anchors[k] = pt,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            // 空子图没有框可贴：从节点端垂一小段占位，保持边的序号对齐。
+            let (_, node) = edge
+                .from_sg
+                .is_none()
+                .then_some((true, edge.from))
+                .unwrap_or((false, edge.to));
+            let p = center_of(node);
+            let stub = finish_line(
+                EdgePath::Curve {
+                    p0: p,
+                    c1: (p.0, p.1 + 3.),
+                    c2: (p.0, p.1 + 6.),
+                    p3: (p.0, p.1 + 9.),
+                },
+                edge.style,
+                edge.left,
+                edge.right,
+                None,
+            );
+            frame_lines.insert(ix, stub);
+            continue;
+        }
+        let (s, t) = (anchors[0], anchors[1]);
+        let (dx, dy) = (t.0 - s.0, t.1 - s.1);
+        let label = edge
+            .label
+            .as_ref()
+            .map(|text| ((s.0 + t.0) / 2., (s.1 + t.1) / 2. - 6., text.clone()));
+        // 竖向主导照常上下弯，横向主导左右弯。
+        let (c1, c2) = if dy.abs() >= dx.abs() {
+            ((s.0, s.1 + dy * 0.45), (t.0, t.1 - dy * 0.45))
+        } else {
+            ((s.0 + dx * 0.45, s.1), (t.0 - dx * 0.45, t.1))
+        };
+        frame_lines.insert(
+            ix,
+            finish_line(
+                EdgePath::Curve { p0: s, c1, c2, p3: t },
+                edge.style,
+                edge.left,
+                edge.right,
+                label,
+            ),
+        );
+    }
+
     let mut edges: Vec<EdgeLine> = graph
         .edges
         .iter()
         .enumerate()
         .map(|(ix, edge)| {
+            // 子图框边：贴外框单独画（见 frame_lines），不走普通布线。
+            if let Some(line) = frame_lines.get(&ix) {
+                return line.clone();
+            }
             let from = &nodes[edge.from];
             let to = &nodes[edge.to];
             let entry_list = &entries[edge.to];
@@ -915,11 +1309,6 @@ pub(super) fn layout(graph: &Graph) -> Layout {
                                 to.y + NODE_H / 2. + offset,
                             )
                         };
-                        let head = if left {
-                            [(ex - 9., cy - 5.), (ex - 9., cy + 5.), (ex, cy)]
-                        } else {
-                            [(ex + 9., cy - 5.), (ex + 9., cy + 5.), (ex, cy)]
-                        };
                         points.push((lane_x, leave));
                         points.push((lane_x, cy));
                         points.push((ex, cy));
@@ -930,14 +1319,16 @@ pub(super) fn layout(graph: &Graph) -> Layout {
                             .label
                             .as_ref()
                             .map(|text| ((out_x + lane_x) / 2., leave - 10., text.clone()));
-                        return EdgeLine {
-                            path: EdgePath::Elbow {
+                        return finish_line(
+                            EdgePath::Elbow {
                                 points,
                                 radius: 10.,
                             },
-                            head,
+                            edge.style,
+                            edge.left,
+                            edge.right,
                             label,
-                        };
+                        );
                     }
 
                     // 其余情况从目标的正上方（或正下方）收进去。
@@ -958,11 +1349,6 @@ pub(super) fn layout(graph: &Graph) -> Layout {
                     } else {
                         tip_y + offset
                     };
-                    let head = if below {
-                        arrow_down(tx, tip_y)
-                    } else {
-                        arrow_up(tx, tip_y)
-                    };
                     points.push((lane_x, leave));
                     points.push((lane_x, join_y));
                     points.push((tx, join_y));
@@ -971,14 +1357,16 @@ pub(super) fn layout(graph: &Graph) -> Layout {
                         .label
                         .as_ref()
                         .map(|text| ((out_x + lane_x) / 2., leave - 10., text.clone()));
-                    EdgeLine {
-                        path: EdgePath::Elbow {
+                    finish_line(
+                        EdgePath::Elbow {
                             points,
                             radius: 10.,
                         },
-                        head,
+                        edge.style,
+                        edge.left,
+                        edge.right,
                         label,
-                    }
+                    )
                 }
                 // 相邻层：一条独立的 S 曲线，起点在自己那一份出口、终点在自己那一份入口。
                 None => {
@@ -1007,16 +1395,18 @@ pub(super) fn layout(graph: &Graph) -> Layout {
                         let (x, y) = cubic_point((sx, sy), c1, c2, (tx, ty), t);
                         (x, y, text.clone())
                     });
-                    EdgeLine {
-                        path: EdgePath::Curve {
+                    finish_line(
+                        EdgePath::Curve {
                             p0: (sx, sy),
                             c1,
                             c2,
                             p3: (tx, ty),
                         },
-                        head: arrow_down(tx, ty),
+                        edge.style,
+                        edge.left,
+                        edge.right,
                         label,
-                    }
+                    )
                 }
             }
         })
@@ -1026,7 +1416,7 @@ pub(super) fn layout(graph: &Graph) -> Layout {
     // 只按 t 均匀分布仍可能因为字宽压住，这里做最后一道保险。
     let mut grouped: Vec<Vec<usize>> = vec![Vec::new(); count];
     for (ix, edge) in graph.edges.iter().enumerate() {
-        if edges[ix].label.is_some() {
+        if edges[ix].label.is_some() && !edge.is_frame() {
             grouped[edge.to].push(ix);
         }
     }

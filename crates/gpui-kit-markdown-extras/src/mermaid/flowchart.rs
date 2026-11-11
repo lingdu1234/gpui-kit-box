@@ -1,7 +1,10 @@
 //! `flowchart` / `graph` 语法解析。
 //!
-//! 支持 `ID[文本]`、`ID{文本}`、`ID(文本)` 三种形状，`-->` / `-.->` / `==>`
-//! 三种箭头，以及 `-->|文字|` 和 `-- 文字 -->` 两种边标注。
+//! 支持 `ID[文本]`、`ID{文本}`、`ID(文本)` 三种形状；连线按「左端 + 线身 + 右端」
+//! 结构化解析：线身含 `.` 为虚线、含 `=` 为粗线，端点是 `>`（箭头）、`o`（圆圈）、
+//! `x`（叉）或没有（`---` 开放连线），覆盖 `-->` / `-.->` / `==>` / `---` /
+//! `--o` / `--x` / `<-->` 及其组合；边标注支持 `-->|文字|`、`-- 文字 -->`、
+//! `-. 文字 .->`、`== 文字 ==>`。
 
 use std::collections::HashMap;
 
@@ -16,6 +19,34 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
 
+    // 先扫一遍子图声明：边可以引用还没写到的子图（前向引用）。
+    let mut sg_ids: HashMap<String, usize> = HashMap::new();
+    let mut sg_labels: Vec<String> = Vec::new();
+    for raw in source.lines() {
+        let line = raw.trim();
+        if !line.to_ascii_lowercase().starts_with("subgraph") {
+            continue;
+        }
+        let (id, label) = subgraph_head(&line["subgraph".len()..]);
+        let label = if label.is_empty() { id.clone() } else { label };
+        sg_labels.push(label);
+        if !id.is_empty() {
+            sg_ids.insert(id, sg_labels.len() - 1);
+        }
+    }
+    let mut overlays: Vec<Overlay> = sg_labels
+        .iter()
+        .map(|label| Overlay {
+            label: label.clone(),
+            anchor: None,
+            members: Vec::new(),
+        })
+        .collect();
+
+    // 正在解析的子图栈：块里的节点要同时记进本层和所有祖先子图的成员。
+    let mut sg_stack: Vec<usize> = Vec::new();
+    let mut decl_ix = 0usize;
+
     for raw in source.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("%%") {
@@ -24,19 +55,36 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("flowchart")
             || lower.starts_with("graph")
-            || lower.starts_with("subgraph")
             || lower.starts_with("style")
             || lower.starts_with("class")
             || lower.starts_with("linkstyle")
             || lower.starts_with("click")
-            || lower == "end"
+            // 只支持自上而下：块内的 `direction LR` 解析但不改排布。
+            || lower.starts_with("direction")
         {
+            continue;
+        }
+        if lower.starts_with("subgraph") {
+            sg_stack.push(decl_ix);
+            decl_ix += 1;
+            continue;
+        }
+        if lower == "end" {
+            sg_stack.pop();
             continue;
         }
         for statement in line.split(';') {
             let statement = statement.trim();
             if !statement.is_empty() {
-                parse_statement(statement, &mut nodes, &mut index, &mut edges);
+                parse_statement(
+                    statement,
+                    &mut nodes,
+                    &mut index,
+                    &mut edges,
+                    &mut overlays,
+                    &sg_stack,
+                    &sg_ids,
+                );
             }
         }
     }
@@ -48,10 +96,35 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
     Some(Graph {
         nodes,
         edges,
-        overlays: Vec::new(),
+        overlays,
         pin_edges: Vec::new(),
         notes: Vec::new(),
     })
+}
+
+/// `subgraph` 后面的头部：`(id, 标题)`。`subgraph id [标题]` 取括号里的标题；
+/// 没有括号时 id 与标题相同（带空格的纯标题没法被边引用，无所谓）。
+fn subgraph_head(rest: &str) -> (String, String) {
+    let rest = rest.trim();
+    match rest.find('[') {
+        Some(at) => {
+            let close = rest[at..].find(']').map(|e| at + e).unwrap_or(rest.len());
+            (
+                rest[..at].trim().to_string(),
+                clean_text(&rest[at + 1..close]),
+            )
+        }
+        None => {
+            let text = clean_text(rest);
+            (text.clone(), text)
+        }
+    }
+}
+
+/// 边的端点：真实节点或子图外框。
+enum Endpoint {
+    Node(usize),
+    Frame(usize),
 }
 
 fn parse_statement(
@@ -59,12 +132,16 @@ fn parse_statement(
     nodes: &mut Vec<GraphNode>,
     index: &mut HashMap<String, usize>,
     edges: &mut Vec<GraphEdge>,
+    overlays: &mut Vec<Overlay>,
+    sg_stack: &[usize],
+    sg_ids: &HashMap<String, usize>,
 ) {
     let mut chunks: Vec<String> = Vec::new();
     let mut labels: Vec<Option<String>> = Vec::new();
+    let mut styles: Vec<(EdgeStyle, EdgeEnd, EdgeEnd)> = Vec::new();
     let mut rest = statement;
 
-    while let Some((at, len)) = find_arrow(rest) {
+    while let Some((at, len, style, l_end, r_end)) = parse_link(rest) {
         let head = rest[..at].trim();
         let mut tail = &rest[at + len..];
         // `B -- 已激活 --> C`：标签写在箭头**前**，要从节点文本里切掉。
@@ -79,56 +156,216 @@ fn parse_statement(
         }
         chunks.push(head);
         labels.push(label);
+        styles.push((style, l_end, r_end));
         rest = tail;
     }
     chunks.push(rest.trim().to_string());
 
-    let mut previous: Option<usize> = None;
+    // 本语句碰到的节点：要记进所在子图（含祖先）的成员。
+    let mut touched: Vec<usize> = Vec::new();
+    let mut previous: Vec<Endpoint> = Vec::new();
     for (ix, chunk) in chunks.iter().enumerate() {
-        let Some((id, label, shape)) = parse_node(chunk) else {
-            previous = None;
-            continue;
-        };
-        let current = match index.get(&id) {
-            Some(&existing) => {
-                // 同一个节点后面再出现时，以第一次的文字为准（手册里写法一致）。
-                existing
+        let mut currents: Vec<Endpoint> = Vec::new();
+        for piece in split_amp(chunk) {
+            // 裸写且已声明的子图 id：端点连到外框，不是节点。
+            if let Some(&sg) = sg_ids.get(piece.trim()) {
+                currents.push(Endpoint::Frame(sg));
+                continue;
             }
-            None => {
-                nodes.push(GraphNode { label, shape });
-                index.insert(id, nodes.len() - 1);
-                nodes.len() - 1
-            }
-        };
-        if let Some(from) = previous {
-            edges.push(GraphEdge {
-                from,
-                to: current,
-                label: labels.get(ix - 1).cloned().flatten(),
-                back: false,
-            });
+            let Some((id, label, shape)) = parse_node(&piece) else {
+                continue;
+            };
+            let current = match index.get(&id) {
+                Some(&existing) => {
+                    // 同一个节点后面再出现时，以第一次的文字为准（手册里写法一致）。
+                    existing
+                }
+                None => {
+                    nodes.push(GraphNode { label, shape });
+                    index.insert(id, nodes.len() - 1);
+                    nodes.len() - 1
+                }
+            };
+            currents.push(Endpoint::Node(current));
+            touched.push(current);
         }
-        previous = Some(current);
+        if currents.is_empty() {
+            // 整段都解析不出节点：链在这里断开。
+            previous.clear();
+            continue;
+        }
+        if !previous.is_empty() {
+            let (style, l_end, r_end) = styles.get(ix - 1).copied().unwrap_or((
+                EdgeStyle::Solid,
+                EdgeEnd::Bare,
+                EdgeEnd::Arrow,
+            ));
+            for from in &previous {
+                for to in &currents {
+                    edges.push(make_edge(
+                        from,
+                        to,
+                        labels.get(ix - 1).cloned().flatten(),
+                        style,
+                        l_end,
+                        r_end,
+                    ));
+                }
+            }
+        }
+        previous = currents;
+    }
+    for &oi in sg_stack {
+        for &node in &touched {
+            if !overlays[oi].members.contains(&node) {
+                overlays[oi].members.push(node);
+            }
+        }
     }
 }
 
-/// 找出最早出现的箭头，返回 `(起始字节, 长度)`。
-fn find_arrow(text: &str) -> Option<(usize, usize)> {
-    const ARROWS: [&str; 6] = ["-.->", "==>", "-->", "-.-", "===", "---"];
-    let mut best: Option<(usize, usize)> = None;
-    for arrow in ARROWS {
-        if let Some(at) = text.find(arrow)
-            && best.is_none_or(|(best_at, _)| at < best_at)
-        {
-            best = Some((at, arrow.len()));
+/// 框边任一端连在子图外框上：占位端记 0，真实框号记在 from_sg / to_sg。
+fn make_edge(
+    from: &Endpoint,
+    to: &Endpoint,
+    label: Option<String>,
+    style: EdgeStyle,
+    left: EdgeEnd,
+    right: EdgeEnd,
+) -> GraphEdge {
+    let (from, from_sg) = match from {
+        Endpoint::Node(ix) => (*ix, None),
+        Endpoint::Frame(sg) => (0, Some(*sg)),
+    };
+    let (to, to_sg) = match to {
+        Endpoint::Node(ix) => (*ix, None),
+        Endpoint::Frame(sg) => (0, Some(*sg)),
+    };
+    GraphEdge {
+        from,
+        to,
+        label,
+        back: false,
+        style,
+        left,
+        right,
+        from_sg,
+        to_sg,
+    }
+}
+
+/// 按括号外的 `&` 切分多路节点：`A --> B & C`、`A & B --> C`。
+/// 引号与括号里的 `&`（如 `A["AT&T"]`）不算分隔符。
+fn split_amp(chunk: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut start = 0usize;
+    for (i, ch) in chunk.char_indices() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            '[' | '{' | '(' if !in_quote => depth += 1,
+            ']' | '}' | ')' if !in_quote => depth -= 1,
+            '&' if depth == 0 && !in_quote => {
+                out.push(chunk[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
         }
     }
-    best
+    out.push(chunk[start..].trim().to_string());
+    out
+}
+
+/// 结构化解析连线记号 `[左端][线身][右端]`，返回
+/// `(起始字节, 长度, 样式, 左端, 右端)`，`at` 指向左端字符（没有左端时指向线首）。
+///
+/// 线身是连续的 `-` / `.` / `=`（含 `.` 为虚线、含 `=` 为粗线）；左端是 `o` / `x`
+/// / `<`，右端是 `>` / `o` / `x`。实线的裸线身要三段以上（`---`）才算连线——
+/// 两段的 `--` 是「`-- 文字 -->`」这种前标签的分隔符，不能吞掉。
+fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for k in 0..chars.len() {
+        let (at, ch) = chars[k];
+        let mut i = k;
+        let left = match ch {
+            'o' => {
+                i += 1;
+                EdgeEnd::Circle
+            }
+            'x' => {
+                i += 1;
+                EdgeEnd::Cross
+            }
+            '<' => {
+                i += 1;
+                EdgeEnd::Arrow
+            }
+            _ => EdgeEnd::Bare,
+        };
+        let (mut dotted, mut thick, mut body) = (false, false, 0usize);
+        while let Some(&(_, c)) = chars.get(i) {
+            match c {
+                '-' => {}
+                '.' => dotted = true,
+                '=' => thick = true,
+                _ => break,
+            }
+            body += 1;
+            i += 1;
+        }
+        let (right, had_end) = match chars.get(i) {
+            Some(&(_, '>')) => (EdgeEnd::Arrow, true),
+            Some(&(_, 'o')) => (EdgeEnd::Circle, true),
+            Some(&(_, 'x')) => (EdgeEnd::Cross, true),
+            _ => (EdgeEnd::Bare, false),
+        };
+        // 统一规则：裸线身要三段以上（`---` / `-.-` / `===`）才算连线；
+        // 两段的 `--` / `-.` / `==` 是「`-- 文字 -->`」这类前标签的分隔符，
+        // 只有紧跟右端符号（`-->` / `-.->` / `==>`）时才按两段算。
+        let ok = body >= 3 || (body >= 2 && had_end);
+        if ok && body > 0 {
+            let end_at = chars
+                .get(i + usize::from(had_end))
+                .map(|&(at, _)| at)
+                .unwrap_or(text.len());
+            let style = if thick {
+                EdgeStyle::Thick
+            } else if dotted {
+                EdgeStyle::Dotted
+            } else {
+                EdgeStyle::Solid
+            };
+            return Some((at, end_at - at, style, left, right));
+        }
+    }
+    None
 }
 
 /// `B -- 已激活` → `("B", Some("已激活"))`：`--` 之后是边标签，不是节点文本。
+/// 虚线 / 粗线的前标签（`A -. 文本 .-> B`）同理，分隔符取括号外**最靠后**的
+/// `--` / `-.` / `==`，免得把 `A[x-.y]` 这种节点文字切坏。
 fn split_trailing_label(chunk: &str) -> (String, Option<String>) {
-    match chunk.rfind("--") {
+    let bytes = chunk.as_bytes();
+    let mut depth = 0i32;
+    let mut cut: Option<usize> = None;
+    for i in 0..bytes.len() {
+        let two = bytes.len() >= i + 2;
+        // 分隔符都是 ASCII；ASCII 字节必然落在字符边界上，这里才能安全切片。
+        if bytes[i].is_ascii()
+            && depth == 0
+            && two
+            && (chunk[i..].starts_with("--") || chunk[i..].starts_with("-.") || chunk[i..].starts_with("=="))
+        {
+            cut = Some(i);
+        }
+        match bytes[i] {
+            b'[' | b'{' | b'(' => depth += 1,
+            b']' | b'}' | b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    match cut {
         Some(at) => {
             let label = clean_text(chunk[at + 2..].trim());
             (
@@ -145,6 +382,19 @@ fn parse_node(chunk: &str) -> Option<(String, String, Shape)> {
     if chunk.is_empty() {
         return None;
     }
+    // `>旗形]`：没有左括号可找，按右尖括号 + 右中括号识别。
+    if !chunk.contains(['[', '{', '('])
+        && let Some(at) = chunk.find('>')
+        && chunk.ends_with(']')
+    {
+        let id = clean_text(chunk[..at].trim());
+        if id.is_empty() {
+            return None;
+        }
+        let text = clean_text(chunk[at + 1..chunk.len() - 1].trim());
+        let label = if text.is_empty() { id.clone() } else { text };
+        return Some((id, label, Shape::Flag));
+    }
     let open_at = chunk.find(['[', '{', '(']);
     let (id, rest) = match open_at {
         Some(at) => (&chunk[..at], &chunk[at..]),
@@ -157,17 +407,7 @@ fn parse_node(chunk: &str) -> Option<(String, String, Shape)> {
     let mut label = id.clone();
     let mut shape = Shape::Rect;
     if !rest.is_empty() {
-        let (open, close, kind) = if rest.starts_with("((") {
-            ("((", "))", Shape::Round)
-        } else if rest.starts_with('(') {
-            ("(", ")", Shape::Round)
-        } else if rest.starts_with('{') {
-            ("{", "}", Shape::Diamond)
-        } else if rest.starts_with("[[") {
-            ("[[", "]]", Shape::Rect)
-        } else {
-            ("[", "]", Shape::Rect)
-        };
+        let (open, close, kind) = shape_delims(rest);
         let inner = &rest[open.len()..];
         let inner = inner.strip_suffix(close).unwrap_or(inner);
         let text = clean_text(inner.trim());
@@ -177,6 +417,38 @@ fn parse_node(chunk: &str) -> Option<(String, String, Shape)> {
         shape = kind;
     }
     Some((id, label, shape))
+}
+
+/// 括号对到形状的判别：先认最长的前缀（`(((` 在 `((` 之前、`([` 在 `(` 之前），
+/// 平行四边形 / 梯形共用 `[/` 前缀，靠**结尾**两个字符区分斜的方向。
+fn shape_delims(rest: &str) -> (&'static str, &'static str, Shape) {
+    if rest.starts_with("(((") {
+        ("(((", ")))", Shape::DoubleCircle)
+    } else if rest.starts_with("((") {
+        ("((", "))", Shape::Circle)
+    } else if rest.starts_with("([") {
+        ("([", "])", Shape::Stadium)
+    } else if rest.starts_with("[(") {
+        ("[(", ")]", Shape::Database)
+    } else if rest.starts_with("[[") {
+        ("[[", "]]", Shape::Subroutine)
+    } else if rest.starts_with("{{") {
+        ("{{", "}}", Shape::Hexagon)
+    } else if rest.starts_with('{') {
+        ("{", "}", Shape::Diamond)
+    } else if rest.starts_with('(') {
+        ("(", ")", Shape::Round)
+    } else if rest.starts_with("[/") && rest.ends_with("\\]") {
+        ("[/", "\\]", Shape::Trap)
+    } else if rest.starts_with("[/") {
+        ("[/", "/]", Shape::Para)
+    } else if rest.starts_with("[\\") && rest.ends_with("/]") {
+        ("[\\", "/]", Shape::TrapAlt)
+    } else if rest.starts_with("[\\") {
+        ("[\\", "\\]", Shape::ParaAlt)
+    } else {
+        ("[", "]", Shape::Rect)
+    }
 }
 
 /// 去掉引号与 `<br/>`，让标签能直接当纯文本画。
@@ -568,5 +840,304 @@ mod tests {
             .collect();
         assert!(labels.contains(&"已激活"));
         assert!(labels.contains(&"首次"));
+    }
+
+    #[test]
+    fn parses_edge_styles_and_ends() {
+        let graph = parse_graph(
+            "flowchart TD\n\
+             A --> B\n\
+             B -.-> C\n\
+             C ==> D\n\
+             D --- E\n\
+             E --o F\n\
+             F --x G\n\
+             H <--> I\n",
+        )
+        .expect("应可解析");
+        let edges = &graph.edges;
+        assert_eq!(edges.len(), 7, "七条连线都应解析出来");
+        assert_eq!(edges[0].style, EdgeStyle::Solid);
+        assert_eq!(edges[0].right, EdgeEnd::Arrow);
+        assert_eq!(edges[1].style, EdgeStyle::Dotted);
+        assert_eq!(edges[2].style, EdgeStyle::Thick);
+        assert_eq!(edges[3].right, EdgeEnd::Bare, "`---` 是开放连线");
+        assert_eq!(edges[4].right, EdgeEnd::Circle);
+        assert_eq!(edges[5].right, EdgeEnd::Cross);
+        assert_eq!(edges[6].left, EdgeEnd::Arrow, "`<-->` 两端都有箭头");
+        assert_eq!(edges[6].right, EdgeEnd::Arrow);
+
+        // 布局后样式落到 EdgeLine：开放连线没有三角，o/x 变成端点记号。
+        let lay = layout(&graph);
+        assert!(lay.edges[0].head.is_some());
+        assert!(lay.edges[3].head.is_none());
+        assert_eq!(lay.edges[1].style, EdgeStyle::Dotted);
+        assert!(lay.edges[4].marks.iter().any(|&(_, _, m)| m == EdgeEnd::Circle));
+        assert!(lay.edges[5].marks.iter().any(|&(_, _, m)| m == EdgeEnd::Cross));
+        assert!(lay.edges[6].left_head.is_some());
+    }
+
+    #[test]
+    fn ampersand_fans_out_and_in() {
+        let graph = parse_graph(
+            "flowchart TD\n\
+             A --> B & C\n\
+             B & C --> D\n\
+             E & F --> G & H --> I\n\
+             J[\"AT&T\"] --> K\n",
+        )
+        .expect("应可解析");
+        assert_eq!(graph.nodes.len(), 11, "不应出现 & 拼成的怪节点");
+        assert_eq!(graph.nodes[9].label, "AT&T", "引号里的 & 不是分隔符");
+        assert_eq!(graph.edges.len(), 11);
+        assert_eq!((graph.edges[0].from, graph.edges[0].to), (0, 1));
+        assert_eq!((graph.edges[1].from, graph.edges[1].to), (0, 2));
+        let hits = |a: usize, b: usize| {
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == a && edge.to == b)
+        };
+        assert!(hits(1, 3) && hits(2, 3), "B & C --> D 是两条入边");
+        for (a, b) in [(4, 6), (4, 7), (5, 6), (5, 7), (6, 8), (7, 8)] {
+            assert!(hits(a, b), "缺少 {a} → {b}");
+        }
+        assert!(hits(9, 10));
+    }
+
+    #[test]
+    fn parses_all_node_shapes() {
+        let src = r#"flowchart TD
+    A([药丸]) --> B[(圆柱)]
+    B --> C((圆))
+    C --> D(((双圆)))
+    D --> E[[子程序]]
+    E --> F{{六边形}}
+    F --> G[/平行四边形/]
+    G --> H[\反平行四边形\]
+    H --> I[/梯形\]
+    I --> J[\反梯形/]
+    J --> K>旗形]
+"#;
+        let graph = parse_graph(src).expect("应可解析");
+        assert_eq!(graph.nodes.len(), 11);
+        let want = [
+            (Shape::Stadium, "药丸"),
+            (Shape::Database, "圆柱"),
+            (Shape::Circle, "圆"),
+            (Shape::DoubleCircle, "双圆"),
+            (Shape::Subroutine, "子程序"),
+            (Shape::Hexagon, "六边形"),
+            (Shape::Para, "平行四边形"),
+            (Shape::ParaAlt, "反平行四边形"),
+            (Shape::Trap, "梯形"),
+            (Shape::TrapAlt, "反梯形"),
+            (Shape::Flag, "旗形"),
+        ];
+        for (ix, (shape, label)) in want.iter().enumerate() {
+            assert_eq!(graph.nodes[ix].shape, *shape, "第 {ix} 个节点形状不对");
+            assert_eq!(graph.nodes[ix].label, *label);
+        }
+    }
+
+    #[test]
+    fn parses_subgraphs_and_frame_edges() {
+        let src = r#"flowchart TD
+    A[入口] --> B[处理]
+    subgraph 盒子 [处理单元]
+        B --> C[子步骤]
+    end
+    C --> D[出口]
+    A --> 盒子
+"#;
+        let graph = parse_graph(src).expect("应可解析");
+        assert_eq!(graph.nodes.len(), 4, "盒子是外框不是节点");
+        assert_eq!(graph.overlays.len(), 1);
+        let ov = &graph.overlays[0];
+        assert_eq!(ov.label, "处理单元");
+        assert!(ov.anchor.is_none(), "子图没有锚点");
+        let node_ix = |label: &str| {
+            graph
+                .nodes
+                .iter()
+                .position(|node| node.label == label)
+                .unwrap()
+        };
+        let (b, c) = (node_ix("处理"), node_ix("子步骤"));
+        assert!(
+            ov.members.contains(&b) && ov.members.contains(&c),
+            "块内节点是成员"
+        );
+        assert!(
+            !ov.members.contains(&node_ix("入口")) && !ov.members.contains(&node_ix("出口")),
+            "块外节点不是成员"
+        );
+        // `A --> 盒子` 是框边：真实端 + 框端，占位端记 0。
+        let a = node_ix("入口");
+        let frame_in = graph
+            .edges
+            .iter()
+            .find(|edge| edge.is_frame())
+            .expect("A --> 盒子 应是框边");
+        assert_eq!(frame_in.from, a);
+        assert_eq!(frame_in.to_sg, Some(0));
+        assert_eq!(frame_in.from_sg, None);
+        // 布局不炸、框边不参与回边标记。
+        let lay = layout(&graph);
+        assert!(!lay.edges.is_empty());
+    }
+
+    #[test]
+    fn frame_edges_anchor_on_the_border() {
+        let src = r#"flowchart TD
+    A[输入] --> 盒子
+    subgraph 盒子 [处理]
+        B --> C
+    end
+    盒子 --> D[输出]
+"#;
+        let graph = parse_graph(src).expect("应可解析");
+        let lay = layout(&graph);
+        assert_eq!(graph.overlays.len(), 1);
+        let (x1, y1, x2, y2, label) = lay.overlays[0].clone();
+        assert_eq!(label, "处理");
+        // 成员全在框内。
+        for &m in &graph.overlays[0].members {
+            let p = lay.nodes[m];
+            assert!(
+                p.x >= x1 && p.x + p.w <= x2 && p.y >= y1 && p.y + NODE_H <= y2,
+                "成员被挤出外框"
+            );
+        }
+        // 框边贴着框边起止：起点/终点落在四条边之一上。
+        let on_border = |(x, y): (f32, f32)| -> bool {
+            const T: f32 = 0.5;
+            ((x - x1).abs() <= T || (x - x2).abs() <= T) && y >= y1 - T && y <= y2 + T
+                || ((y - y1).abs() <= T || (y - y2).abs() <= T) && x >= x1 - T && x <= x2 + T
+        };
+        let mut checked = 0;
+        for (ix, edge) in graph.edges.iter().enumerate() {
+            if !edge.is_frame() {
+                continue;
+            }
+            let points = lay.edges[ix].path.points();
+            if edge.to_sg.is_some() {
+                assert!(
+                    on_border(*points.last().expect("框边有终点")),
+                    "进入子图的线要落在框边上"
+                );
+            }
+            if edge.from_sg.is_some() {
+                assert!(
+                    on_border(*points.first().expect("框边有起点")),
+                    "离开子图的线要从框边出发"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "进、出各一条框边");
+        // 框后的节点落在外框下方。
+        let d = graph
+            .nodes
+            .iter()
+            .position(|node| node.label == "输出")
+            .unwrap();
+        assert!(lay.nodes[d].y >= y2, "框后的节点应在外框下方");
+    }
+
+    /// 展示页里带框边的图（服务拓扑）：框边端点必须贴在某个外框边上。
+    #[test]
+    fn showcase_subgraph_frame_edges_anchor_on_border() {
+        let mut checked = 0;
+        for block in showcase_blocks() {
+            let Some(graph) = parse_graph(&block) else {
+                continue;
+            };
+            if !graph.edges.iter().any(|edge| edge.is_frame()) {
+                continue;
+            }
+            let lay = layout(&graph);
+            let on_border = |(x, y): (f32, f32)| -> bool {
+                const T: f32 = 0.5;
+                lay.overlays.iter().any(|&(x1, y1, x2, y2, _)| {
+                    ((x - x1).abs() <= T || (x - x2).abs() <= T)
+                        && y >= y1 - T
+                        && y <= y2 + T
+                        || ((y - y1).abs() <= T || (y - y2).abs() <= T)
+                            && x >= x1 - T
+                            && x <= x2 + T
+                })
+            };
+            for (ix, edge) in graph.edges.iter().enumerate() {
+                if !edge.is_frame() {
+                    continue;
+                }
+                let points = lay.edges[ix].path.points();
+                if edge.to_sg.is_some() {
+                    assert!(
+                        on_border(*points.last().expect("框边有终点")),
+                        "展示页第 {ix} 条框边的入点不在任何外框边上"
+                    );
+                }
+                if edge.from_sg.is_some() {
+                    assert!(
+                        on_border(*points.first().expect("框边有起点")),
+                        "展示页第 {ix} 条框边的出点不在任何外框边上"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 3, "展示页应有一张带 3 条框边的子图");
+    }
+
+    #[test]
+    fn nested_subgraphs_union_members() {        let src = r#"flowchart TD
+    A --> B
+    subgraph 外 [外层]
+        subgraph 内 [内层]
+            B --> C
+        end
+        C --> D
+    end
+"#;
+        let graph = parse_graph(src).expect("应可解析");
+        assert_eq!(graph.overlays.len(), 2);
+        let (outer, inner) = (&graph.overlays[0], &graph.overlays[1]);
+        let ix = |label: &str| {
+            graph
+                .nodes
+                .iter()
+                .position(|node| node.label == label)
+                .unwrap()
+        };
+        let (b, c, d) = (ix("B"), ix("C"), ix("D"));
+        assert_eq!(inner.members, vec![b, c], "内层只含自己的成员");
+        assert_eq!(outer.members, vec![b, c, d], "祖先子图收下全部成员");
+        assert_eq!(inner.label, "内层");
+        assert_eq!(outer.label, "外层");
+    }
+
+    #[test]
+    fn parses_labels_on_every_link_style() {
+        let graph = parse_graph(
+            "flowchart TD\n\
+             A -- 文本 --> B\n\
+             B -->|标注| C\n\
+             C -. 虚字 .-> D\n\
+             D == 粗字 ==> E\n",
+        )
+        .expect("应可解析");
+        assert_eq!(graph.nodes.len(), 5, "标签不能被当成节点");
+        let labels: Vec<_> = graph
+            .edges
+            .iter()
+            .filter_map(|edge| edge.label.clone())
+            .collect();
+        for text in ["文本", "标注", "虚字", "粗字"] {
+            assert!(labels.contains(&text.to_string()), "缺少标签「{text}」");
+        }
+        assert_eq!(graph.edges[2].style, EdgeStyle::Dotted);
+        assert_eq!(graph.edges[3].style, EdgeStyle::Thick);
     }
 }

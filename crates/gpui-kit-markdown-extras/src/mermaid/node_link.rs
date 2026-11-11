@@ -94,6 +94,9 @@ enum Symbol {
     Bar(f32, f32),
     /// `<<choice>>`：空心菱形。
     Diamond(f32, f32, f32, f32),
+    /// 流程图的异形节点：圆、双圆、六边形、圆柱、子程序、斜面四边形、旗形。
+    /// `(shape, x0, y0, w, h)`。
+    Odd(Shape, f32, f32, f32, f32),
 }
 
 /// 形如 `fork1` / `paid_check` / `check` 的小写标识符：只是给图用的内部名字，
@@ -118,8 +121,19 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
     let look = Style::new(state, &pal);
     let layout = layout(graph);
 
-    let paths: Vec<EdgePath> = layout.edges.iter().map(|e| e.path.clone()).collect();
-    let heads: Vec<[(f32, f32); 3]> = layout.edges.iter().map(|e| e.head).collect();
+    let paths: Vec<(EdgePath, EdgeStyle)> = layout
+        .edges
+        .iter()
+        .map(|e| (e.path.clone(), e.style))
+        .collect();
+    let heads: Vec<Option<[(f32, f32); 3]>> = layout.edges.iter().map(|e| e.head).collect();
+    let left_heads: Vec<Option<[(f32, f32); 3]>> =
+        layout.edges.iter().map(|e| e.left_head).collect();
+    let marks: Vec<(f32, f32, EdgeEnd)> = layout
+        .edges
+        .iter()
+        .flat_map(|e| e.marks.iter().copied())
+        .collect();
     let labels: Vec<(f32, f32, String)> = layout
         .edges
         .iter()
@@ -149,7 +163,10 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
             // 有名字的 fork/join 当普通状态画（见下面节点框的分支），只有
             // 名字是内部标识符时才退化成同步条。
             Shape::Bar if is_machine_id(&node.label) => symbols.push(Symbol::Bar(cx, cy)),
-            _ => {}
+            Shape::Diamond => {}
+            // 方框、圆角框、药丸由 div 画，其余异形交给 canvas。
+            Shape::Rect | Shape::Round | Shape::Stadium => {}
+            shape => symbols.push(Symbol::Odd(shape, p.x, p.y, p.w, NODE_H)),
         }
     }
     // 菱形尺寸由布局层算（比文字框大一圈），直接搬过来。
@@ -219,26 +236,46 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
             let (ox, oy) = (origin.x, origin.y);
             let at = |p: &(f32, f32)| point(ox + px(p.0), oy + px(p.1));
 
-            for edge_path in &paths {
-                let mut builder = PathBuilder::stroke(px(1.2));
-                match edge_path {
-                    EdgePath::Curve { p0, c1, c2, p3 } => {
-                        builder.move_to(at(p0));
-                        builder.cubic_bezier_to(at(p3), at(c1), at(c2));
+            for (edge_path, style) in &paths {
+                match style {
+                    EdgeStyle::Dotted => {
+                        // GPUI 的 PathBuilder 没有虚线，把路径采样后切成小段。
+                        for (a, b) in dash_segments(&sample_path(edge_path), 5., 4.) {
+                            let mut builder = PathBuilder::stroke(px(1.2));
+                            builder.move_to(at(&a));
+                            builder.line_to(at(&b));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, pal.line);
+                            }
+                        }
                     }
-                    EdgePath::Elbow { points, radius } => {
-                        rounded_elbow(&mut builder, points, *radius, &at);
+                    _ => {
+                        let mut builder = PathBuilder::stroke(if *style == EdgeStyle::Thick {
+                            px(2.4)
+                        } else {
+                            px(1.2)
+                        });
+                        match edge_path {
+                            EdgePath::Curve { p0, c1, c2, p3 } => {
+                                builder.move_to(at(p0));
+                                builder.cubic_bezier_to(at(p3), at(c1), at(c2));
+                            }
+                            EdgePath::Elbow { points, radius } => {
+                                rounded_elbow(&mut builder, points, *radius, &at);
+                            }
+                        }
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, pal.line);
+                        }
                     }
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, pal.line);
                 }
             }
 
             // 箭头：状态图用开口的 V（贴近 Mermaid），流程图保留实心三角。
+            // `---` / `--o` / `--x` 这类没有三角箭头的端点不画。
             if state {
                 let mut barbs = PathBuilder::stroke(px(1.2));
-                for head in &heads {
+                for head in heads.iter().flatten().chain(left_heads.iter().flatten()) {
                     let tip = head[2];
                     for corner in [head[0], head[1]] {
                         // 三角顶点缩到 72%，把实心箭头的两条斜边留成 V 形箭头。
@@ -254,7 +291,7 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                     window.paint_path(path, pal.line);
                 }
             } else {
-                for head in &heads {
+                for head in heads.iter().flatten().chain(left_heads.iter().flatten()) {
                     let mut builder = PathBuilder::fill();
                     builder.move_to(at(&(head[0].0, head[0].1)));
                     builder.line_to(at(&(head[1].0, head[1].1)));
@@ -263,6 +300,44 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                     if let Ok(path) = builder.build() {
                         window.paint_path(path, pal.line);
                     }
+                }
+            }
+
+            // `--o` / `--x` 端点记号：圆圈先用页底色盖住线身再描边。
+            for (mx, my, mark) in &marks {
+                match mark {
+                    EdgeEnd::Circle => {
+                        let mut fill = PathBuilder::fill();
+                        let ring = circle_points(*mx, *my, 3.5);
+                        fill.move_to(at(&ring[0]));
+                        for p in &ring[1..] {
+                            fill.line_to(at(p));
+                        }
+                        fill.close();
+                        if let Ok(path) = fill.build() {
+                            window.paint_path(path, pal.background);
+                        }
+                        let mut stroke = PathBuilder::stroke(px(1.2));
+                        stroke.move_to(at(&ring[0]));
+                        for p in &ring[1..] {
+                            stroke.line_to(at(p));
+                        }
+                        stroke.close();
+                        if let Ok(path) = stroke.build() {
+                            window.paint_path(path, pal.line);
+                        }
+                    }
+                    EdgeEnd::Cross => {
+                        for (dx, dy) in [(-3.2, -3.2), (-3.2, 3.2)] {
+                            let mut builder = PathBuilder::stroke(px(1.2));
+                            builder.move_to(at(&(*mx + dx, *my + dy)));
+                            builder.line_to(at(&(*mx - dx, *my - dy)));
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, pal.line);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -378,6 +453,132 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
                             window.paint_path(path, pal.frame_outline);
                         }
                     }
+                    Symbol::Odd(shape, x0, y0, w, h) => {
+                        let (x0, y0, w, h) = (*x0, *y0, *w, *h);
+                        let x1 = x0 + w;
+                        let y1 = y0 + h;
+                        let cx = x0 + w / 2.;
+                        let cy = y0 + h / 2.;
+                        let s = 14.;
+                        let (mut fills, mut strokes): (
+                            Vec<Vec<(f32, f32)>>,
+                            Vec<Vec<(f32, f32)>>,
+                        ) = (Vec::new(), Vec::new());
+                        match shape {
+                            Shape::Circle => {
+                                strokes.push(ellipse_points(cx, cy, h / 2. - 1., h / 2. - 1., false));
+                            }
+                            Shape::DoubleCircle => {
+                                strokes.push(ellipse_points(cx, cy, h / 2. - 1., h / 2. - 1., false));
+                                strokes.push(ellipse_points(cx, cy, h / 2. - 7., h / 2. - 7., false));
+                            }
+                            Shape::Hexagon => {
+                                let poly = vec![
+                                    (x0, cy),
+                                    (x0 + 12., y0),
+                                    (x1 - 12., y0),
+                                    (x1, cy),
+                                    (x1 - 12., y1),
+                                    (x0 + 12., y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            Shape::Database => {
+                                let e = 7.;
+                                let rx = w / 2.;
+                                // 主体：矩形身 + 底部外凸弧，一起填充盖住穿过线。
+                                let mut body = vec![(x0, y0 + e), (x1, y0 + e), (x1, y1 - e)];
+                                body.extend(ellipse_points(cx, y1 - e, rx, e, true));
+                                fills.push(body);
+                                strokes.push(ellipse_points(cx, y0 + e, rx, e, false));
+                                strokes.push(vec![(x0, y0 + e), (x0, y1 - e)]);
+                                strokes.push(vec![(x1, y0 + e), (x1, y1 - e)]);
+                            }
+                            Shape::Subroutine => {
+                                let rect = vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+                                fills.push(rect.clone());
+                                strokes.push(rect);
+                                strokes.push(vec![(x0 + 7., y0), (x0 + 7., y1)]);
+                                strokes.push(vec![(x1 - 7., y0), (x1 - 7., y1)]);
+                            }
+                            Shape::Para => {
+                                let poly = vec![
+                                    (x0 + s, y0),
+                                    (x1, y0),
+                                    (x1 - s, y1),
+                                    (x0, y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            Shape::ParaAlt => {
+                                let poly = vec![
+                                    (x0, y0),
+                                    (x1 - s, y0),
+                                    (x1, y1),
+                                    (x0 + s, y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            Shape::Trap => {
+                                let poly = vec![
+                                    (x0 + s, y0),
+                                    (x1 - s, y0),
+                                    (x1, y1),
+                                    (x0, y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            Shape::TrapAlt => {
+                                let poly = vec![
+                                    (x0, y0),
+                                    (x1, y0),
+                                    (x1 - s, y1),
+                                    (x0 + s, y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            Shape::Flag => {
+                                let poly = vec![
+                                    (x0, y0),
+                                    (x1 - s, y0),
+                                    (x1, cy),
+                                    (x1 - s, y1),
+                                    (x0, y1),
+                                ];
+                                fills.push(poly.clone());
+                                strokes.push(poly);
+                            }
+                            _ => {}
+                        }
+                        // 先填充盖住从框下穿过的连线，再描边。
+                        for poly in &fills {
+                            let mut fill = PathBuilder::fill();
+                            fill.move_to(at(&poly[0]));
+                            for p in &poly[1..] {
+                                fill.line_to(at(p));
+                            }
+                            fill.close();
+                            if let Ok(path) = fill.build() {
+                                window.paint_path(path, look.node_fill);
+                            }
+                        }
+                        for poly in &strokes {
+                            let mut stroke = PathBuilder::stroke(px(1.4));
+                            stroke.move_to(at(&poly[0]));
+                            for p in &poly[1..] {
+                                stroke.line_to(at(p));
+                            }
+                            stroke.close();
+                            if let Ok(path) = stroke.build() {
+                                window.paint_path(path, pal.outline);
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -405,9 +606,12 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
         .child(paint);
 
     // 复合状态的锚点不画自身的方框：外框就是复合状态，标题画在标题栏里。
+    // 子图（flowchart）没有锚点，成员方框照常画。
     let mut anchors = vec![false; graph.nodes.len()];
     for ov in &graph.overlays {
-        anchors[ov.anchor] = true;
+        if let Some(anchor) = ov.anchor {
+            anchors[anchor] = true;
+        }
     }
     for (ix, node) in graph.nodes.iter().enumerate() {
         if anchors[ix] {
@@ -441,10 +645,41 @@ pub(super) fn render_node_link(graph: &Graph, style: NodeLinkStyle, cx: &App) ->
         if node.shape == Shape::Bar && is_machine_id(&node.label) {
             continue; // 同步条由 canvas 画，名字只在有语义时才有意义
         }
+        if matches!(
+            node.shape,
+            Shape::Circle
+                | Shape::DoubleCircle
+                | Shape::Hexagon
+                | Shape::Database
+                | Shape::Subroutine
+                | Shape::Para
+                | Shape::ParaAlt
+                | Shape::Trap
+                | Shape::TrapAlt
+                | Shape::Flag
+        ) {
+            // 字形由 canvas 画（见上面的 Odd 符号），这里只放居中的文字。
+            container = container.child(
+                div()
+                    .absolute()
+                    .left(px(placed.x))
+                    .top(px(placed.y))
+                    .w(px(placed.w))
+                    .h(px(NODE_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(FONT))
+                    .child(div().text_center().px_1().child(label.to_string())),
+            );
+            continue;
+        }
         let radius = if state {
             px(6.)
         } else if node.shape == Shape::Round {
             px(18.)
+        } else if node.shape == Shape::Stadium {
+            px(NODE_H / 2.)
         } else {
             px(6.)
         };
@@ -535,6 +770,68 @@ fn circle_points(cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
             (cx + r * a.cos(), cy + r * a.sin())
         })
         .collect()
+}
+
+/// 16 等分椭圆；`half` 为 true 时只取下半弧（圆柱的底部）。
+fn ellipse_points(cx: f32, cy: f32, rx: f32, ry: f32, half: bool) -> Vec<(f32, f32)> {
+    let (n, end) = if half {
+        (8, std::f32::consts::PI)
+    } else {
+        (16, std::f32::consts::TAU)
+    };
+    (0..=n)
+        .map(|i| {
+            let a = end * i as f32 / n as f32;
+            (cx + rx * a.cos(), cy + ry * a.sin())
+        })
+        .collect()
+}
+
+/// 采样连线为折线：曲线取 24 个点，折线保持折点。
+fn sample_path(path: &EdgePath) -> Vec<(f32, f32)> {
+    match path {
+        EdgePath::Curve { p0, c1, c2, p3 } => (0..=24)
+            .map(|i| cubic_point(*p0, *c1, *c2, *p3, i as f32 / 24.))
+            .collect(),
+        EdgePath::Elbow { points, .. } => points.clone(),
+    }
+}
+
+/// 沿折线切出「画 dash、空 gap」的小段：GPUI 的 PathBuilder 不支持虚线，
+/// 只能把路径走一遍、按剩余长度交替画与不画。
+fn dash_segments(points: &[(f32, f32)], dash: f32, gap: f32) -> Vec<((f32, f32), (f32, f32))> {
+    let mut out = Vec::new();
+    let Some(&first) = points.first() else {
+        return out;
+    };
+    let mut prev = first;
+    let mut drawing = true;
+    let mut left = dash;
+    for &p in &points[1..] {
+        loop {
+            let dx = p.0 - prev.0;
+            let dy = p.1 - prev.1;
+            let remaining = (dx * dx + dy * dy).sqrt();
+            if remaining <= 1e-4 {
+                break;
+            }
+            let step = left.min(remaining);
+            let next = (
+                prev.0 + dx / remaining * step,
+                prev.1 + dy / remaining * step,
+            );
+            if drawing {
+                out.push((prev, next));
+            }
+            prev = next;
+            left -= step;
+            if left <= 1e-4 {
+                drawing = !drawing;
+                left = if drawing { dash } else { gap };
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

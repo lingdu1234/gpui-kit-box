@@ -1,6 +1,6 @@
 # 流程图
 
-Mermaid `flowchart` 的三张示例，由浅入深覆盖分层、扇出、扇入、回边、菱形判断与边标注，全部由 GPUI 原生绘制。
+Mermaid `flowchart` 的四张示例，由浅入深覆盖分层、扇出、扇入、回边、菱形判断、边标注与 subgraph 子图，全部由 GPUI 原生绘制。
 
 ## 1 发布流水线（扇出 / 扇入 / 三段回边）
 
@@ -75,4 +75,26 @@ flowchart TD
     Suppress --> Store
     Dead --> Replay[人工重放]
     Replay -.-> Parse
+```
+
+## 4 服务拓扑（subgraph 子图）
+
+请求经接入层进数据层：两个子图外框各包住一组节点，节点与框、框与框的连线都直接贴在外框边上；框间的粗线表示同步调用，层内缓存用虚线和圆柱节点表示。
+
+```mermaid
+flowchart TD
+    User[用户请求] --> 盒子
+
+    subgraph 盒子 [接入层]
+        GW{网关} --> Svc[业务服务]
+    end
+
+    盒子 ==> 盒子2
+
+    subgraph 盒子2 [数据层]
+        Api[API 服务] -.-> Cache[(缓存)]
+        Api --> DB[(数据库)]
+    end
+
+    盒子2 --> Ops[写入监控]
 ```

@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use super::common::clean_label;
-use super::layout::{Graph, GraphEdge, GraphNode, Overlay, Shape, mark_back_edges};
+use super::layout::{EdgeEnd, EdgeStyle, Graph, GraphEdge, GraphNode, Overlay, Shape, mark_back_edges};
 
 /// `[*]` 每次出现都是独立的一个圆（起点与终点不能共用一个节点）。
 /// 其余 id 复用同一个节点，后写的 `<<choice>>` 等声明会覆盖形状。
@@ -99,6 +99,11 @@ fn add_edge(
         to,
         label,
         back: false,
+        style: EdgeStyle::Solid,
+        left: EdgeEnd::Bare,
+        right: EdgeEnd::Arrow,
+        from_sg: None,
+        to_sg: None,
     });
     (from, to)
 }
@@ -196,7 +201,7 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
             }
             overlays.push(Overlay {
                 label: clean_label(name),
-                anchor: parent,
+                anchor: Some(parent),
                 members,
             });
             continue;
@@ -336,7 +341,11 @@ mod tests {
             .iter()
             .position(|n| n.label == "paid_check")
             .unwrap();
-        let ov = g.overlays.iter().find(|ov| ov.anchor == anchor).unwrap();
+        let ov = g
+            .overlays
+            .iter()
+            .find(|ov| ov.anchor == Some(anchor))
+            .unwrap();
         let inner: Vec<usize> = ov.members.iter().copied().filter(|&m| m != anchor).collect();
         assert!(!inner.is_empty(), "复合状态应有内部成员");
         for &m in &inner {
@@ -386,12 +395,13 @@ mod tests {
             let g = parse(&src).unwrap();
             let l = super::super::layout::layout(&g);
             for (oi, ov) in g.overlays.iter().enumerate() {
+                let Some(anchor_ix) = ov.anchor else { continue; };
                 let (x1, y1, _, y2, _) = l.overlays[oi];
-                let anchor = l.nodes[ov.anchor].y;
+                let anchor_y = l.nodes[anchor_ix].y;
                 let first = ov
                     .members
                     .iter()
-                    .filter(|&&m| m != ov.anchor)
+                    .filter(|&&m| m != anchor_ix)
                     .map(|&m| l.nodes[m])
                     .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap())
                     .expect("复合状态应有内部成员");
@@ -402,7 +412,7 @@ mod tests {
                     ov.label
                 );
                 assert!(
-                    first.y < anchor + NODE_H + 8.,
+                    first.y < anchor_y + NODE_H + 8.,
                     "「{}」第一层应紧贴锚点行，而不是被整行间距推下去",
                     ov.label
                 );

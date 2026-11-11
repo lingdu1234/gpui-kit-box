@@ -331,7 +331,7 @@ mod tests {
         let blocks = all_showcase_blocks();
         assert_eq!(
             blocks.len(),
-            19,
+            20,
             "展示页的图数量变了，需要重新确认测试覆盖范围"
         );
         let mut kinds: Vec<&str> = blocks.iter().filter_map(|b| diagram_kind(b)).collect();
