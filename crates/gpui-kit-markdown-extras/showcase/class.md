@@ -115,7 +115,7 @@ classDiagram
 
 ## 5 自关系与样式指令
 
-`Worker --> Worker` 是自关系，回环画在类框侧面而不穿过别的框；`classDef` / `cssClass` 是样式指令，解析时直接跳过，不会误生成名为「classDef …」的类。
+`Worker --> Worker` 是自关系，回环画在类框侧面而不穿过别的框；`classDef` 定义样式类，`cssClass "ID" 类名` 把样式挂到节点——节点 ID 要带引号，这是官方 mermaid 的要求（gpui-kit 会跳过这些指令，不实际应用样式）。
 
 ```mermaid
 classDiagram
@@ -131,5 +131,5 @@ classDiagram
     Worker --> Queue : 投递任务
     Worker --> Worker : 失败自重试
     classDef highlight fill:#f9f,stroke:#333
-    cssClass Worker highlight
+    cssClass "Worker" highlight
 ```

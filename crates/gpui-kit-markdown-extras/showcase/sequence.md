@@ -1,6 +1,6 @@
 # 时序图
 
-Mermaid `sequenceDiagram` 的六张示例：参与者、消息、激活框、注释与组合片段（`alt` / `else` / `opt` / `par` / `loop` / `break`），以及带起始 / 步长的 `autonumber`、`create` / `destroy` 与反向箭头，都由 GPUI 原生绘制。
+Mermaid `sequenceDiagram` 的六张示例：参与者、消息、激活框、注释与组合片段（`alt` / `else` / `opt` / `par` / `loop` / `break`），以及带起始 / 步长的 `autonumber` 与 `create` / `destroy`，都由 GPUI 原生绘制。
 
 ## 1 基础：请求与响应
 
@@ -110,9 +110,9 @@ sequenceDiagram
     end
 ```
 
-## 5 编号起始 / 步长与反向箭头
+## 5 编号起始 / 步长
 
-`autonumber 10 5` 从 10 起、每条 +5（10 / 15 / 20 / 25）。`C<-S`、`S<<--C` 是反向箭头：右端才是发送方，渲染时按坐标自然朝左，箭头类型分别保留实线与虚线实心。
+`autonumber 10 5` 从 10 起、每条 +5（10 / 15 / 20 / 25），适合给消息编号留出间隔或从指定值开始。
 
 ```mermaid
 sequenceDiagram
@@ -121,8 +121,8 @@ sequenceDiagram
     participant S as 服务端
     C->>S: 提交表单
     S-->>C: 返回回执
-    C<-S: 反向同步
-    S<<--C: 反向异步
+    S->>C: 异步通知
+    C-->>S: 回执确认
 ```
 
 ## 6 动态创建与销毁
