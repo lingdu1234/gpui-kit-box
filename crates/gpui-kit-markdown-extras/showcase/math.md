@@ -79,3 +79,37 @@ $$\alpha + \beta = \gamma, \quad \mu \pm \sigma, \quad \Delta \approx 0, \quad \
 | 变异系数 | $CV = \frac{s}{\bar{x}} \times 100\%$ | $CV \le 15\%$ |
 | 相关系数 | $r$ | $r \ge 0.99$ |
 | 偏倚 | $Bias\% = \frac{\bar{x}-\mu}{\mu} \times 100\%$ | 绝对值 ≤ 10% |
+
+## 7 矩阵与扩充记号
+
+矩阵环境（`pmatrix` / `bmatrix` / `vmatrix`）与分段函数 `cases`：
+
+$$A = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}, \quad B = \begin{bmatrix} a & b \\ c & d \end{bmatrix}, \quad \det A = \begin{vmatrix} 1 & 2 \\ 3 & 4 \end{vmatrix}$$
+
+$$f(x) = \begin{cases} x^2 & x \ge 0 \\ -x & x < 0 \end{cases}$$
+
+带根指数的根号、堆叠上下标与二项式系数：
+
+$$\sqrt[3]{x^2 + 1}, \quad x_i^2, \quad \binom{n}{k} = \frac{n!}{k!(n-k)!}$$
+
+黑板粗体 / 花体 / 哥特体，以及 boxed、underline 与扩充符号：
+
+$$\mathbb{R}, \quad \mathbb{N} \subseteq \mathbb{Z}, \quad \mathcal{L}\{f\}, \quad \mathfrak{g}$$
+
+$$\boxed{E = mc^2}, \quad \underline{a + b}, \quad \langle x, y \rangle, \quad A \oplus B, \quad p \land q \lor \neg r, \quad x \mapsto y \iff z$$
+
+## 8 对齐环境与堆叠记号
+
+花括号 / 双竖线矩阵（`Bmatrix` / `Vmatrix`）：
+
+$$\begin{Bmatrix} 1 & 2 \\ 3 & 4 \end{Bmatrix}, \quad \begin{Vmatrix} a & b \\ c & d \end{Vmatrix}$$
+
+多行对齐与聚集（`aligned` / `gathered`，不带定界符）：
+
+$$\begin{aligned} (a+b)^2 &= a^2 + 2ab + b^2 \\ (a-b)^2 &= a^2 - 2ab + b^2 \end{aligned}$$
+
+$$\begin{gathered} x = 1 \\ y = 2 \end{gathered}$$
+
+上下堆叠（`overset` / `underset` / `stackrel`）、上划线与编号：
+
+$$\overset{\text{def}}{=} \quad \underset{n\to\infty}{\lim}\, a_n \quad \stackrel{!}{=} \quad \overline{z} \quad \tag{8}$$

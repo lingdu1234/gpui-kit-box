@@ -51,6 +51,31 @@ pub(super) enum EdgeEnd {
     Cross,
 }
 
+/// 排布方向：`TD`/`TB` 自上而下（默认）、`LR` 自左而右、`RL` 自右而左、`BT` 自下而上。
+///
+/// 引擎内部始终按 TD 计算，非 TD 方向在 [`layout`] 末尾对结果做一次几何变换：
+/// BT 是纯竖直镜像，LR 是「层转列 + 通用重布线」，RL 再叠一次水平镜像。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum Direction {
+    #[default]
+    Td,
+    Lr,
+    Rl,
+    Bt,
+}
+
+impl Direction {
+    /// 解析方向关键字；`TD`/`TB` 及不认识的一律退回 TD。
+    pub(super) fn parse(token: &str) -> Self {
+        match token.trim().to_ascii_uppercase().as_str() {
+            "LR" => Direction::Lr,
+            "RL" => Direction::Rl,
+            "BT" => Direction::Bt,
+            _ => Direction::Td,
+        }
+    }
+}
+
 fn unit(v: (f32, f32)) -> (f32, f32) {
     let len = (v.0 * v.0 + v.1 * v.1).sqrt().max(1e-4);
     (v.0 / len, v.1 / len)
@@ -189,6 +214,8 @@ pub(super) struct GraphEdge {
     /// 端点连在子图外框上时记录框的序号；此时 from/to 是占位的 0。
     pub(super) from_sg: Option<usize>,
     pub(super) to_sg: Option<usize>,
+    /// `~~~` 隐形连线：照常参与分层与列对齐，但渲染层不画（只用来撑间距 / 定次序）。
+    pub(super) invisible: bool,
 }
 
 impl GraphEdge {
@@ -208,6 +235,8 @@ pub(super) struct Graph {
     pub(super) pin_edges: Vec<(usize, usize)>,
     /// 依附在某个节点右侧的说明文字：`(节点, 文本)`。
     pub(super) notes: Vec<(usize, String)>,
+    /// 排布方向；默认 TD。非 TD 时 [`layout`] 末尾对几何做一次方向变换。
+    pub(super) direction: Direction,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +543,24 @@ fn blocked_between(
     }
     false
 }
+
+/// 布局入口：先按 TD 算出几何，再按 `graph.direction` 做方向变换。
+/// TD 直接返回引擎结果，几何与原先逐像素一致。
 pub(super) fn layout(graph: &Graph) -> Layout {
+    let mut lay = layout_td(graph);
+    match graph.direction {
+        Direction::Td => {}
+        Direction::Bt => mirror_vertical(&mut lay),
+        Direction::Lr => reorient_lr(graph, &mut lay),
+        Direction::Rl => {
+            reorient_lr(graph, &mut lay);
+            mirror_horizontal(&mut lay);
+        }
+    }
+    lay
+}
+
+fn layout_td(graph: &Graph) -> Layout {
     let count = graph.nodes.len();
 
     // 锚点 → 复合状态的桥：进出锚点的连线要贴外框顶/底边。子图没有锚点。
@@ -1458,4 +1504,453 @@ pub(super) fn layout(graph: &Graph) -> Layout {
         ranks: rank,
         overlays,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 方向变换：TD 之外的排布在布局末尾对几何做一次映射
+// ---------------------------------------------------------------------------
+
+/// 对一条 EdgeLine 的全部坐标（路径、两端箭头、记号、标签）套用映射 `f`。
+fn map_line(line: &mut EdgeLine, f: &impl Fn((f32, f32)) -> (f32, f32)) {
+    match &mut line.path {
+        EdgePath::Curve { p0, c1, c2, p3 } => {
+            *p0 = f(*p0);
+            *c1 = f(*c1);
+            *c2 = f(*c2);
+            *p3 = f(*p3);
+        }
+        EdgePath::Elbow { points, .. } => {
+            for p in points.iter_mut() {
+                *p = f(*p);
+            }
+        }
+    }
+    if let Some(tri) = &mut line.head {
+        for p in tri.iter_mut() {
+            *p = f(*p);
+        }
+    }
+    if let Some(tri) = &mut line.left_head {
+        for p in tri.iter_mut() {
+            *p = f(*p);
+        }
+    }
+    for mark in line.marks.iter_mut() {
+        let (x, y, end) = *mark;
+        let (nx, ny) = f((x, y));
+        *mark = (nx, ny, end);
+    }
+    if let Some((x, y, _)) = &mut line.label {
+        let (nx, ny) = f((*x, *y));
+        *x = nx;
+        *y = ny;
+    }
+}
+
+/// BT：纯竖直镜像。方框镜像后仍是同尺寸正框，箭头随路径一起翻转，无需重新布线。
+fn mirror_vertical(lay: &mut Layout) {
+    let h = lay.height;
+    let f = |(x, y): (f32, f32)| (x, h - y);
+    for p in lay.nodes.iter_mut() {
+        p.y = h - p.y - NODE_H;
+    }
+    for line in lay.edges.iter_mut() {
+        map_line(line, &f);
+    }
+    for d in lay.diamonds.iter_mut() {
+        d.cy = h - d.cy;
+    }
+    for ov in lay.overlays.iter_mut() {
+        let (y1, y2) = (ov.1, ov.3);
+        ov.1 = h - y2;
+        ov.3 = h - y1;
+    }
+}
+
+/// RL 的第二步：水平镜像。箭头三角随坐标镜像后朝向自然翻转，不必交换左右端。
+fn mirror_horizontal(lay: &mut Layout) {
+    let w = lay.width;
+    let f = |(x, y): (f32, f32)| (w - x, y);
+    for p in lay.nodes.iter_mut() {
+        p.x = w - p.x - p.w;
+    }
+    for line in lay.edges.iter_mut() {
+        map_line(line, &f);
+    }
+    for d in lay.diamonds.iter_mut() {
+        d.cx = w - d.cx;
+    }
+    for ov in lay.overlays.iter_mut() {
+        let (x1, x2) = (ov.0, ov.2);
+        ov.0 = w - x2;
+        ov.2 = w - x1;
+    }
+}
+
+/// 整体平移：LR 重排后把包围盒归一到左上角留 PAD，保证所有几何都在画布内。
+fn translate(lay: &mut Layout, dx: f32, dy: f32) {
+    let f = |(x, y): (f32, f32)| (x + dx, y + dy);
+    for p in lay.nodes.iter_mut() {
+        p.x += dx;
+        p.y += dy;
+    }
+    for line in lay.edges.iter_mut() {
+        map_line(line, &f);
+    }
+    for d in lay.diamonds.iter_mut() {
+        d.cx += dx;
+        d.cy += dy;
+    }
+    for ov in lay.overlays.iter_mut() {
+        ov.0 += dx;
+        ov.1 += dy;
+        ov.2 += dx;
+        ov.3 += dy;
+    }
+}
+
+/// 全部几何（节点、菱形、外框、连线路径 / 箭头 / 记号 / 标签）的包围盒。
+fn geometry_bounds(lay: &Layout) -> (f32, f32, f32, f32) {
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    let mut eat = |x: f32, y: f32| {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    };
+    for p in &lay.nodes {
+        eat(p.x, p.y);
+        eat(p.x + p.w, p.y + NODE_H);
+    }
+    for d in &lay.diamonds {
+        eat(d.cx - d.hw, d.cy - d.hh);
+        eat(d.cx + d.hw, d.cy + d.hh);
+    }
+    for (x1, y1, x2, y2, _) in &lay.overlays {
+        eat(*x1, *y1);
+        eat(*x2, *y2);
+    }
+    for line in &lay.edges {
+        let pts = match &line.path {
+            EdgePath::Curve { p0, c1, c2, p3 } => vec![*p0, *c1, *c2, *p3],
+            EdgePath::Elbow { points, .. } => points.clone(),
+        };
+        for (x, y) in pts {
+            eat(x, y);
+        }
+        for tri in line.head.into_iter().chain(line.left_head) {
+            for (x, y) in tri {
+                eat(x, y);
+            }
+        }
+        for (x, y, _) in &line.marks {
+            eat(*x, *y);
+        }
+        if let Some((x, y, _)) = &line.label {
+            eat(*x, *y);
+        }
+    }
+    if min_x == f32::MAX {
+        (0., 0., 0., 0.)
+    } else {
+        (min_x, min_y, max_x, max_y)
+    }
+}
+
+/// LR：把 TD 的「层」转成「列」、层内次序转成列内上下次序，再用一套通用布线重连。
+///
+/// TD 的层间距（~150px）小于节点宽度（可达 300px），直接转置会重叠，所以按列宽
+/// 重新沿 x 排布、列内沿 y 堆叠并绕共同中线居中。布线不复刻 TD 的左右侧通道机械：
+/// 正向边走「右出左入」的三次曲线，回边绕上下通道，同层边竖直相连。
+fn reorient_lr(graph: &Graph, lay: &mut Layout) {
+    let count = graph.nodes.len();
+    let depth = lay.ranks.iter().copied().max().unwrap_or(0) + 1;
+    let rank = lay.ranks.clone();
+    let old = lay.nodes.clone();
+
+    // 列：每层节点按 TD 的 x 升序（保留重心法算出的层内次序）。
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); depth];
+    for i in 0..count {
+        columns[rank[i]].push(i);
+    }
+    for col in columns.iter_mut() {
+        col.sort_by(|&a, &b| {
+            old[a].x.partial_cmp(&old[b].x).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let col_w: Vec<f32> = columns
+        .iter()
+        .map(|col| col.iter().map(|&i| old[i].w).fold(0., f32::max))
+        .collect();
+
+    const COL_GAP: f32 = H_GAP;
+    const ROW_GAP: f32 = 54.;
+    let mut x_center = vec![0f32; depth];
+    let mut acc = 0.;
+    for r in 0..depth {
+        x_center[r] = acc + col_w[r] / 2.;
+        acc += col_w[r] + COL_GAP;
+    }
+    let max_count = columns.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+    let max_col_h = max_count as f32 * NODE_H + (max_count - 1) as f32 * ROW_GAP;
+    let mid_y = max_col_h / 2.;
+    for r in 0..depth {
+        let col = &columns[r];
+        let n = col.len().max(1);
+        let col_h = n as f32 * NODE_H + (n - 1) as f32 * ROW_GAP;
+        let start = mid_y - col_h / 2.;
+        for (slot, &i) in col.iter().enumerate() {
+            lay.nodes[i].x = x_center[r] - old[i].w / 2.;
+            lay.nodes[i].y = start + slot as f32 * (NODE_H + ROW_GAP);
+        }
+    }
+    let placed = lay.nodes.clone();
+
+    // 菱形按新方框重算（仍是正菱形，不随方向旋转）。
+    lay.diamonds.clear();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if node.shape == Shape::Diamond {
+            let p = placed[i];
+            lay.diamonds.push(Diamond {
+                cx: p.x + p.w / 2.,
+                cy: p.y + NODE_H / 2.,
+                hw: p.w / 2. + 22.,
+                hh: NODE_H / 2. + 16.,
+            });
+        }
+    }
+
+    // 外框：成员新包围盒外扩一圈，留白与 TD 相同；空框占位 None 保持序号对齐。
+    let mut ov_rects: Vec<Option<(f32, f32, f32, f32)>> = vec![None; graph.overlays.len()];
+    lay.overlays.clear();
+    for (oi, ov) in graph.overlays.iter().enumerate() {
+        let mut b: Option<(f32, f32, f32, f32)> = None;
+        for &m in &ov.members {
+            let p = placed[m];
+            let q = (p.x, p.y, p.x + p.w, p.y + NODE_H);
+            b = Some(match b {
+                Some((a, bb, c, d)) => (a.min(q.0), bb.min(q.1), c.max(q.2), d.max(q.3)),
+                None => q,
+            });
+        }
+        if let Some((x1, y1, x2, y2)) = b {
+            let rect = (x1 - 26., y1 - OVERLAY_TOP, x2 + 26., y2 + OVERLAY_BOTTOM);
+            ov_rects[oi] = Some(rect);
+            lay.overlays.push((rect.0, rect.1, rect.2, rect.3, ov.label.clone()));
+        }
+    }
+
+    let cx = |i: usize| placed[i].x + placed[i].w / 2.;
+    let cy = |i: usize| placed[i].y + NODE_H / 2.;
+    // 节点边上的锚点：side 0=上 1=下 2=左 3=右；菱形沿斜边摊开，方框沿边均分。
+    let port = |i: usize, frac: f32, side: u8| -> (f32, f32) {
+        let p = placed[i];
+        let (ccx, ccy) = (cx(i), cy(i));
+        if graph.nodes[i].shape == Shape::Diamond {
+            let hw = p.w / 2. + 22.;
+            let hh = NODE_H / 2. + 16.;
+            if side >= 2 {
+                let dy = (frac - 0.5) * 2. * hh * 0.55;
+                let half = hw * (1. - dy.abs() / hh);
+                (if side == 3 { ccx + half } else { ccx - half }, ccy + dy)
+            } else {
+                let dx = (frac - 0.5) * 2. * hw * 0.55;
+                let half = hh * (1. - dx.abs() / hw);
+                (ccx + dx, if side == 1 { ccy + half } else { ccy - half })
+            }
+        } else {
+            match side {
+                0 => (p.x + p.w * frac, p.y),
+                1 => (p.x + p.w * frac, p.y + NODE_H),
+                2 => (p.x, p.y + NODE_H * frac),
+                _ => (p.x + p.w, p.y + NODE_H * frac),
+            }
+        }
+    };
+
+    // 正向边（目标列在右）右出左入；回边 / 同层边走上下端口。各自按另一端位置摊开锚点。
+    let mut out_fwd: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut in_fwd: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut out_back: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut in_back: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (ix, e) in graph.edges.iter().enumerate() {
+        if e.is_frame() {
+            continue;
+        }
+        if rank[e.to] > rank[e.from] {
+            out_fwd[e.from].push(ix);
+            in_fwd[e.to].push(ix);
+        } else {
+            out_back[e.from].push(ix);
+            in_back[e.to].push(ix);
+        }
+    }
+    let by = |lists: &mut [Vec<usize>], key: fn(&GraphEdge) -> usize, val: &dyn Fn(usize) -> f32| {
+        for list in lists.iter_mut() {
+            list.sort_by(|&a, &b| {
+                val(key(&graph.edges[a]))
+                    .partial_cmp(&val(key(&graph.edges[b])))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    };
+    by(&mut out_fwd, |e| e.to, &cy);
+    by(&mut in_fwd, |e| e.from, &cy);
+    by(&mut out_back, |e| e.to, &cx);
+    by(&mut in_back, |e| e.from, &cx);
+    let slot_of = |list: &Vec<usize>, ix: usize| list.iter().position(|&x| x == ix).unwrap_or(0);
+    let spread = |slot: usize, n: usize| (slot as f32 + 1.) / (n.max(1) as f32 + 1.);
+
+    // 回边的上下通道：靠近中线的走上 / 下侧，按序号向外排开。
+    let area_top = placed
+        .iter()
+        .map(|p| p.y)
+        .chain(lay.overlays.iter().map(|o| o.1))
+        .fold(f32::MAX, f32::min);
+    let area_bottom = placed
+        .iter()
+        .map(|p| p.y + NODE_H)
+        .chain(lay.overlays.iter().map(|o| o.3))
+        .fold(f32::MIN, f32::max);
+    let (mut above_n, mut below_n) = (0usize, 0usize);
+    let mut lane_of: Vec<Option<(bool, usize)>> = vec![None; graph.edges.len()];
+    for (ix, e) in graph.edges.iter().enumerate() {
+        if e.is_frame() || rank[e.to] >= rank[e.from] {
+            continue;
+        }
+        let above = (cy(e.from) + cy(e.to)) / 2. < mid_y;
+        let idx = if above {
+            above_n += 1;
+            above_n - 1
+        } else {
+            below_n += 1;
+            below_n - 1
+        };
+        lane_of[ix] = Some((above, idx));
+    }
+    let lane_y = |above: bool, idx: usize| {
+        if above {
+            area_top - LANE_MARGIN - LANE_W * (idx as f32 + 0.5)
+        } else {
+            area_bottom + LANE_MARGIN + LANE_W * (idx as f32 + 0.5)
+        }
+    };
+
+    // 子图框边：两端各自贴「朝向另一端」的那条边（节点边或外框边），连一条主轴曲线。
+    let end_center = |e: &GraphEdge, is_from: bool| -> Option<(f32, f32)> {
+        let (sg, node) = if is_from { (e.from_sg, e.from) } else { (e.to_sg, e.to) };
+        match sg {
+            Some(oi) => ov_rects[oi].map(|(x1, y1, x2, y2)| ((x1 + x2) / 2., (y1 + y2) / 2.)),
+            None => Some((cx(node), cy(node))),
+        }
+    };
+    let facing = |rect: (f32, f32, f32, f32), other: (f32, f32)| -> u8 {
+        let (x1, y1, x2, y2) = rect;
+        let (dx, dy) = (other.0 - (x1 + x2) / 2., other.1 - (y1 + y2) / 2.);
+        if dy.abs() * (x2 - x1) >= dx.abs() * (y2 - y1) {
+            if dy < 0. { 0 } else { 1 }
+        } else if dx < 0. {
+            2
+        } else {
+            3
+        }
+    };
+    let frame_line = |e: &GraphEdge| -> EdgeLine {
+        let anchor = |is_from: bool, other: (f32, f32)| -> (f32, f32) {
+            let (sg, node) = if is_from { (e.from_sg, e.from) } else { (e.to_sg, e.to) };
+            if let Some(rect) = sg.and_then(|oi| ov_rects[oi]) {
+                let (x1, y1, x2, y2) = rect;
+                return match facing(rect, other) {
+                    0 => ((x1 + x2) / 2., y1),
+                    1 => ((x1 + x2) / 2., y2),
+                    2 => (x1, (y1 + y2) / 2.),
+                    _ => (x2, (y1 + y2) / 2.),
+                };
+            }
+            let p = placed[node];
+            port(node, 0.5, facing((p.x, p.y, p.x + p.w, p.y + NODE_H), other))
+        };
+        let s = anchor(true, end_center(e, false).unwrap_or((0., 0.)));
+        let t = anchor(false, end_center(e, true).unwrap_or((0., 0.)));
+        let (dx, dy) = (t.0 - s.0, t.1 - s.1);
+        let (c1, c2) = if dy.abs() >= dx.abs() {
+            ((s.0, s.1 + dy * 0.45), (t.0, t.1 - dy * 0.45))
+        } else {
+            ((s.0 + dx * 0.45, s.1), (t.0 - dx * 0.45, t.1))
+        };
+        let label = e.label.clone().map(|text| ((s.0 + t.0) / 2., (s.1 + t.1) / 2. - 6., text));
+        finish_line(EdgePath::Curve { p0: s, c1, c2, p3: t }, e.style, e.left, e.right, label)
+    };
+
+    let mut lines: Vec<EdgeLine> = Vec::with_capacity(graph.edges.len());
+    for (ix, e) in graph.edges.iter().enumerate() {
+        if e.is_frame() {
+            lines.push(frame_line(e));
+            continue;
+        }
+        let mid_label = |s: (f32, f32), c1: (f32, f32), c2: (f32, f32), t: (f32, f32)| {
+            e.label.clone().map(|text| {
+                let (x, y) = cubic_point(s, c1, c2, t, 0.5);
+                (x, y - 8., text)
+            })
+        };
+        if rank[e.to] > rank[e.from] {
+            let fo = spread(slot_of(&out_fwd[e.from], ix), out_fwd[e.from].len());
+            let fi = spread(slot_of(&in_fwd[e.to], ix), in_fwd[e.to].len());
+            let s = port(e.from, fo, 3);
+            let t = port(e.to, fi, 2);
+            let dx = (t.0 - s.0).max(1.);
+            let (c1, c2) = ((s.0 + dx * 0.45, s.1), (t.0 - dx * 0.45, t.1));
+            let label = mid_label(s, c1, c2, t);
+            lines.push(finish_line(
+                EdgePath::Curve { p0: s, c1, c2, p3: t },
+                e.style,
+                e.left,
+                e.right,
+                label,
+            ));
+        } else if rank[e.to] == rank[e.from] {
+            // 同层：竖直相连，控制点右弓一点，免得压住列内中间的节点。
+            let below = placed[e.to].y >= placed[e.from].y;
+            let fo = spread(slot_of(&out_back[e.from], ix), out_back[e.from].len());
+            let fi = spread(slot_of(&in_back[e.to], ix), in_back[e.to].len());
+            let s = port(e.from, fo, if below { 1 } else { 0 });
+            let t = port(e.to, fi, if below { 0 } else { 1 });
+            let dy = (t.1 - s.1).abs().max(1.);
+            let sign = if below { 1. } else { -1. };
+            let (c1, c2) = ((s.0 + 26., s.1 + sign * dy * 0.45), (t.0 + 26., t.1 - sign * dy * 0.45));
+            let label = mid_label(s, c1, c2, t);
+            lines.push(finish_line(
+                EdgePath::Curve { p0: s, c1, c2, p3: t },
+                e.style,
+                e.left,
+                e.right,
+                label,
+            ));
+        } else {
+            let (above, idx) = lane_of[ix].unwrap_or((false, 0));
+            let ly = lane_y(above, idx);
+            let fo = spread(slot_of(&out_back[e.from], ix), out_back[e.from].len());
+            let fi = spread(slot_of(&in_back[e.to], ix), in_back[e.to].len());
+            let s = port(e.from, fo, if above { 0 } else { 1 });
+            let t = port(e.to, fi, if above { 0 } else { 1 });
+            let points = vec![s, (s.0, ly), (t.0, ly), t];
+            let label = e.label.clone().map(|text| ((s.0 + t.0) / 2., ly - 8., text));
+            lines.push(finish_line(
+                EdgePath::Elbow { points, radius: 10. },
+                e.style,
+                e.left,
+                e.right,
+                label,
+            ));
+        }
+    }
+    lay.edges = lines;
+
+    // 归一：把包围盒左上角移到 PAD，宽高按实际占位收边，所有几何都落在画布内。
+    let (min_x, min_y, max_x, max_y) = geometry_bounds(lay);
+    translate(lay, PAD - min_x, PAD - min_y);
+    lay.width = (max_x - min_x) + 2. * PAD;
+    lay.height = (max_y - min_y) + 2. * PAD;
 }

@@ -1,6 +1,6 @@
 # 流程图
 
-Mermaid `flowchart` 的四张示例，由浅入深覆盖分层、扇出、扇入、回边、菱形判断、边标注与 subgraph 子图，全部由 GPUI 原生绘制。
+Mermaid `flowchart` 的七张示例，由浅入深覆盖分层、扇出、扇入、回边、菱形判断、边标注与 subgraph 子图，以及 LR / RL / BT 方向与 `~~~` 隐形连线，全部由 GPUI 原生绘制。
 
 ## 1 发布流水线（扇出 / 扇入 / 三段回边）
 
@@ -97,4 +97,32 @@ flowchart TD
     end
 
     盒子2 --> Ops[写入监控]
+```
+
+## 5 横向排布与隐形连线（LR + `~~~`）
+
+`flowchart LR` 把分层方向转成从左到右；`B ~~~ C` 是隐形连线——参与分层、把「入库」钉在「清洗」右侧，但不画线，常用来对齐没有调用关系的节点。
+
+```mermaid
+flowchart LR
+    A[采集] --> B[清洗]
+    B ~~~ C[入库]
+```
+
+## 6 从右到左（RL）
+
+`flowchart RL` 是 LR 的水平镜像：起点排在最右，沿箭头向左推进。
+
+```mermaid
+flowchart RL
+    Z[终点] --> Y[中转] --> X[起点]
+```
+
+## 7 自下而上（BT）
+
+`flowchart BT` 把起点放在最底、终点放在最顶，单链横向居中。
+
+```mermaid
+flowchart BT
+    Base[地基] --> Frame[框架] --> Roof[封顶]
 ```

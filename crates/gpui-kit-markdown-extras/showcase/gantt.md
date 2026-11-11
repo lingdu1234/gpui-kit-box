@@ -1,6 +1,6 @@
 # 甘特图
 
-Mermaid `gantt` 的四张示例：任务名写在条形里，`done` / `active` / `crit` 用主题语义色区分，里程碑是空心菱形，`excludes weekends` 把周末涂成淡色竖带。
+Mermaid `gantt` 的五张示例：任务名写在条形里，`done` / `active` / `crit` 用主题语义色区分，里程碑是空心菱形，`excludes weekends` 把周末涂成淡色竖带，以及 `m` / `M` / `h` / `s` / `ms` 等时长单位与排除具体节假日。
 
 ## 1 基础：小型迭代
 
@@ -81,4 +81,26 @@ gantt
     section 后续
     验收 :crit, s4, after s3, 2d
     里程碑 :milestone, s5, after s4, 0d
+```
+
+## 5 时长单位与排除节假日
+
+单字符单位大小写敏感：`m` 是分钟、`M` 是月（30 天），另有 `h` 时、`s` 秒、`ms` 毫秒、`d` 天、`w` 周、`y` 年。`excludes weekends, 2026-01-07, 2026-01-08` 在周末之外再排除两个具体节假日，多行 `excludes` 会累加。
+
+```mermaid
+gantt
+    title 时长单位与节假日排除
+    dateFormat YYYY-MM-DD
+    axisFormat %m/%d
+    tickInterval 1week
+    excludes weekends, 2026-01-07, 2026-01-08
+    todayMarker off
+    section 精确计时
+    短会 :done, u1, 2026-01-05, 90m
+    半天 :active, u2, after u1, 4h
+    毫秒 : u3, after u2, 86400000ms
+    section 日历跨度
+    三天 :crit, u4, 2026-01-05, 3d
+    一周 : u5, after u4, 1w
+    一月 : u6, after u5, 1M
 ```

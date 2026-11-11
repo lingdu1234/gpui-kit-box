@@ -36,16 +36,6 @@ use gpui_kit::{App, IntoElement, Window, div};
 
 mod common;
 
-// 等比适配包装：可用空间不足时整图同比例缩小（见 `fit.rs` 顶部说明）。
-#[cfg(any(
-    feature = "mermaid-flowchart",
-    feature = "mermaid-state",
-    feature = "mermaid-sequence",
-    feature = "mermaid-class",
-    feature = "mermaid-gantt"
-))]
-mod fit;
-
 // 图表配色的唯一来源：所有 Mermaid 图共用一套色阶（见 `palette.rs` 顶部说明）。
 // 「后续新增的图也必须从这里取色」由 `palette.rs` 的扫描测试守住。
 #[cfg(any(
@@ -210,7 +200,7 @@ macro_rules! diagram_plugin {
                         // 测量父容器空间，不足时把整图（含文字）同比例缩小。
                         let data = data.clone();
                         let (w, h) = $size(&data);
-                        fit::FitDiagram::new(w, h, move |scale, _window, cx| {
+                        crate::fit::FitDiagram::new(w, h, move |scale, _window, cx| {
                             $render(&data, scale, cx)
                         })
                         .into_any_element()
@@ -357,7 +347,7 @@ mod tests {
         let blocks = all_showcase_blocks();
         assert_eq!(
             blocks.len(),
-            20,
+            29,
             "展示页的图数量变了，需要重新确认测试覆盖范围"
         );
         let mut kinds: Vec<&str> = blocks.iter().filter_map(|b| diagram_kind(b)).collect();

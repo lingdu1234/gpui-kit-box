@@ -205,23 +205,42 @@ pub(super) fn render_node_link(
     let look = Style::new(state, &pal);
     let layout = layout(graph);
 
+    // `~~~` 隐形连线照常参与布局，但这里不画：按序号过滤掉 invisible 的边。
+    let visible = |ix: usize| !graph.edges[ix].invisible;
     let paths: Vec<(EdgePath, EdgeStyle)> = layout
         .edges
         .iter()
-        .map(|e| (e.path.clone(), e.style))
+        .enumerate()
+        .filter(|(ix, _)| visible(*ix))
+        .map(|(_, e)| (e.path.clone(), e.style))
         .collect();
-    let heads: Vec<Option<[(f32, f32); 3]>> = layout.edges.iter().map(|e| e.head).collect();
-    let left_heads: Vec<Option<[(f32, f32); 3]>> =
-        layout.edges.iter().map(|e| e.left_head).collect();
+    let heads: Vec<Option<[(f32, f32); 3]>> = layout
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(ix, _)| visible(*ix))
+        .map(|(_, e)| e.head)
+        .collect();
+    let left_heads: Vec<Option<[(f32, f32); 3]>> = layout
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(ix, _)| visible(*ix))
+        .map(|(_, e)| e.left_head)
+        .collect();
     let marks: Vec<(f32, f32, EdgeEnd)> = layout
         .edges
         .iter()
-        .flat_map(|e| e.marks.iter().copied())
+        .enumerate()
+        .filter(|(ix, _)| visible(*ix))
+        .flat_map(|(_, e)| e.marks.iter().copied())
         .collect();
     let labels: Vec<(f32, f32, String)> = layout
         .edges
         .iter()
-        .filter_map(|e| e.label.clone())
+        .enumerate()
+        .filter(|(ix, _)| visible(*ix))
+        .filter_map(|(_, e)| e.label.clone())
         .collect();
 
     // 起点 / 终点都画成 `[*]`：靠出入度区分，起点只有出边、终点只有入边。

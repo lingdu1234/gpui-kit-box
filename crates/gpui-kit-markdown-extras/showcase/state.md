@@ -1,6 +1,6 @@
 # 状态图
 
-Mermaid `stateDiagram-v2` 的四张示例：`[*]` 起止圆、`<<choice>>` 空心菱形、`<<fork>>` / `<<join>>`（有名字画成节点，只有内部标识符才画成同步条）、带标题栏的复合状态与注释。
+Mermaid `stateDiagram-v2` 的六张示例：`[*]` 起止圆、`<<choice>>` 空心菱形、`<<fork>>` / `<<join>>`（有名字画成节点，只有内部标识符才画成同步条）、带标题栏的复合状态与注释，以及 `direction` 方向、冒号描述与 `--` 并发区域。
 
 ## 1 基础：开关
 
@@ -76,4 +76,37 @@ stateDiagram-v2
     state Join <<join>>
     Join --> Publish
     Publish --> [*]
+```
+
+## 5 方向与冒号描述
+
+`direction LR` 把状态机转成横向；`state Idle: 空闲` 用冒号给状态起显示名（内部仍按 `Idle` 连线），描述与方向可叠加。
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state Idle: 空闲
+    state Run: 运行中
+    state Done: 已完成
+    [*] --> Idle
+    Idle --> Run : 启动
+    Run --> Done : 完成
+    Done --> [*]
+```
+
+## 6 并发区域（`--`）
+
+复合状态里用独立成行的 `--` 分出两条并发链，各自有起止，外框包住全部成员并紧贴标题栏。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Processing
+    state Processing {
+        [*] --> Upload
+        Upload --> Validate
+        --
+        [*] --> Index
+        Index --> Cache
+    }
+    Processing --> [*]
 ```

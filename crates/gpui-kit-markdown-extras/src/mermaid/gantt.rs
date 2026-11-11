@@ -52,7 +52,7 @@ use gpui_kit::{
 use super::common::{clean_label, text_width};
 use super::palette;
 
-// 版式常量：改动会直接影响四张示例图的观感，调整时对着 showcase/gantt.md 一起看。
+// 版式常量：改动会直接影响五张示例图的观感，调整时对着 showcase/gantt.md 一起看。
 const PAD: f32 = 20.;
 const TITLE_H: f32 = 34.;
 const ROW_H: f32 = 28.;
@@ -154,20 +154,29 @@ fn parse_date(text: &str, fmt: &str) -> Option<i64> {
     Some(days_from_civil(y, m, d))
 }
 
-/// 时长转天数：`d`/`day` 天、`w` 周、`m`/`month` 月（30 天）、`h` 小时。
+/// 时长转天数。Mermaid 的单位区分大小写：`m` 是分钟、`M` 才是月（30 天）；
+/// 另有 `y` 年（365 天）、`w` 周、`d` 天、`h` 小时、`s` 秒、`ms` 毫秒。
 fn parse_duration(text: &str) -> Option<f32> {
-    let s = text.trim().to_ascii_lowercase();
+    let s = text.trim();
     let digits: String = s
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
     let value: f32 = digits.parse().ok()?;
-    let unit: String = s.chars().skip(digits.len()).collect();
-    let scale = match unit.trim().chars().next() {
-        Some('w') => 7.,
-        Some('m') => 30.,
-        Some('h') => 1. / 24.,
-        _ => 1.,
+    let unit = s[digits.len()..].trim();
+    let scale = if unit.eq_ignore_ascii_case("ms") {
+        1. / 86_400_000.
+    } else {
+        match unit.chars().next()? {
+            'y' => 365.,
+            'M' => 30.,
+            'w' => 7.,
+            'd' => 1.,
+            'h' => 1. / 24.,
+            'm' => 1. / 1440.,
+            's' => 1. / 86_400.,
+            _ => return None,
+        }
     };
     Some(value * scale)
 }
@@ -216,6 +225,8 @@ pub(super) struct GanttChart {
     /// `tickInterval`；`None` 表示按每天占的像素自动挑步长，避免标签挤在一起。
     tick_days: Option<f32>,
     exclude_weekends: bool,
+    /// `excludes` 里写明的具体日期（节假日等），与周末一样不计入工时但占日历宽度。
+    excluded_dates: Vec<i64>,
     today_marker: bool,
 }
 
@@ -233,6 +244,7 @@ pub(super) fn parse(source: &str) -> Option<GanttChart> {
         axis_fmt: "%m/%d".to_string(),
         tick_days: None,
         exclude_weekends: false,
+        excluded_dates: Vec::new(),
         today_marker: true,
     };
     let mut section = 0usize;
@@ -259,27 +271,46 @@ pub(super) fn parse(source: &str) -> Option<GanttChart> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("tickInterval ") {
-            let v = rest.trim().to_ascii_lowercase();
-            let n: f32 = v
+            let v = rest.trim();
+            let lower = v.to_ascii_lowercase();
+            let n: f32 = lower
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
                 .collect::<String>()
                 .parse()
                 .unwrap_or(1.);
-            let scale = if v.contains("week") {
+            let scale = if lower.contains("millisecond") {
+                1. / 86_400_000.
+            } else if lower.contains("week") {
                 7.
-            } else if v.contains("month") {
+            } else if lower.contains("month") {
                 30.
-            } else if v.contains("hour") {
+            } else if lower.contains("hour") {
                 1. / 24.
+            } else if lower.contains("minute") {
+                1. / 1440.
+            } else if lower.contains("second") {
+                1. / 86_400.
             } else {
-                1.
+                // 单字符单位（`3d`、`2h`…）复用任务时长解析，大小写敏感。
+                parse_duration(v).map(|days| days / n).unwrap_or(1.)
             };
             chart.tick_days = Some((n * scale).max(1.));
             continue;
         }
         if lower.starts_with("excludes ") {
-            chart.exclude_weekends = lower.contains("weekend");
+            // `excludes weekends` 之外还能列具体日期（节假日），逗号/空白分隔，
+            // 多行 excludes 累加。日期按 dateFormat 解析。
+            chart.exclude_weekends |= lower.contains("weekend");
+            let rest = line["excludes ".len()..].trim();
+            for token in rest.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+                if token.eq_ignore_ascii_case("weekends") {
+                    continue;
+                }
+                if let Some(day) = parse_date(token, &chart.date_fmt) {
+                    chart.excluded_dates.push(day);
+                }
+            }
             continue;
         }
         if lower.starts_with("todaymarker ") {
@@ -403,7 +434,7 @@ struct GanttLayout {
     labels: Vec<RowLabel>,
     bars: Vec<Bar>,
     ticks: Vec<(f32, String)>,
-    /// 周末淡色带的 x 区间（只在 `excludes weekends` 时非空）。
+    /// 非工作日淡色带的 x 区间（`excludes weekends` 或列了具体日期时非空）。
     weekends: Vec<(f32, f32)>,
     today_x: Option<f32>,
     chart_top: f32,
@@ -447,19 +478,24 @@ fn groups(chart: &GanttChart) -> Vec<Group> {
     out
 }
 
+/// 该日是否不计入工时：`excludes weekends` 的周末 + `excludes` 列出的具体日期。
+fn is_excluded(day: i64, chart: &GanttChart) -> bool {
+    (chart.exclude_weekends && is_weekend(day)) || chart.excluded_dates.contains(&day)
+}
+
 /// 从 `start` 起按工作日推进 `days` 天，返回结束日（不含）。
 ///
-/// 起点落在周末时先顺延到周一；推进过程中周末不计入天数，但**占日历宽度**，
+/// 起点落在非工作日时先顺延；推进过程中非工作日不计入天数，但**占日历宽度**，
 /// 这样「3d」的任务从周五开始会画到周一，中间压着周末带。
-fn add_workdays(start: i64, days: i64) -> i64 {
+fn add_workdays(start: i64, days: i64, chart: &GanttChart) -> i64 {
     let mut day = start;
-    while is_weekend(day) {
+    while is_excluded(day, chart) {
         day += 1;
     }
     let mut remaining = days.max(1);
     while remaining > 0 {
         day += 1;
-        if !is_weekend(day) {
+        if !is_excluded(day, chart) {
             remaining -= 1;
         }
     }
@@ -496,8 +532,8 @@ fn resolve_ranges(chart: &GanttChart) -> Vec<(i64, i64)> {
             };
             let end = match task.end_date {
                 Some(e) => e,
-                None if chart.exclude_weekends => {
-                    add_workdays(start, task.duration.ceil().max(1.) as i64)
+                None if chart.exclude_weekends || !chart.excluded_dates.is_empty() => {
+                    add_workdays(start, task.duration.ceil().max(1.) as i64, chart)
                 }
                 None => start + task.duration.ceil().max(1.) as i64,
             };
@@ -516,14 +552,15 @@ fn resolve_ranges(chart: &GanttChart) -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// 把 `[min_day, max_day]` 里的周末合并成连续区间，供画淡色竖带用。
-fn weekend_spans(min_day: i64, max_day: i64) -> Vec<(i64, i64)> {
+/// 把 `[min_day, max_day]` 里的非工作日（周末 + excludes 日期）合并成连续区间，
+/// 供画淡色竖带用。
+fn excluded_spans(min_day: i64, max_day: i64, chart: &GanttChart) -> Vec<(i64, i64)> {
     let mut spans = Vec::new();
     let mut d = min_day;
     while d <= max_day {
-        if is_weekend(d) {
+        if is_excluded(d, chart) {
             let start = d;
-            while d <= max_day && is_weekend(d) {
+            while d <= max_day && is_excluded(d, chart) {
                 d += 1;
             }
             spans.push((start, d));
@@ -650,8 +687,8 @@ fn layout(chart: &GanttChart) -> GanttLayout {
         d += step;
     }
 
-    let weekends = if chart.exclude_weekends {
-        weekend_spans(min_day, max_day)
+    let weekends = if chart.exclude_weekends || !chart.excluded_dates.is_empty() {
+        excluded_spans(min_day, max_day, chart)
             .into_iter()
             .map(|(a, b)| {
                 (
@@ -1098,6 +1135,23 @@ mod tests {
         );
     }
 
+    /// 单位区分大小写：`m` 是分钟、`M` 才是月。旧实现一律 lowercase，
+    /// `30m`（半小时）会被当成 30 个月，条形直接飞出画布。
+    #[test]
+    fn duration_units_are_case_sensitive() {
+        assert_eq!(parse_duration("3d"), Some(3.));
+        assert_eq!(parse_duration("2w"), Some(14.));
+        assert_eq!(parse_duration("1M"), Some(30.));
+        assert_eq!(parse_duration("1y"), Some(365.));
+        assert_eq!(parse_duration("12h"), Some(0.5));
+        assert_eq!(parse_duration("30m"), Some(30. / 1440.));
+        assert_eq!(parse_duration("90s"), Some(90. / 86_400.));
+        assert_eq!(parse_duration("500ms"), Some(500. / 86_400_000.));
+        assert_eq!(parse_duration("1.5d"), Some(1.5));
+        assert_eq!(parse_duration("3x"), None, "未知单位不能默默当成天");
+        assert_eq!(parse_duration("abc"), None);
+    }
+
     #[test]
     fn parses_sections_statuses_and_dependencies() {
         let c = parse(SAMPLE).expect("应可解析");
@@ -1119,24 +1173,41 @@ mod tests {
     /// 周五起 3d 要跨过周末落到周三，条形因此会压住周末带。
     #[test]
     fn workday_duration_skips_weekend_but_keeps_axis() {
+        let c = parse(SAMPLE).unwrap();
         let friday = days_from_civil(2026, 1, 9);
         assert_eq!(weekday(friday), 5);
-        let end = add_workdays(friday, 3);
+        let end = add_workdays(friday, 3, &c);
         assert_eq!(end, days_from_civil(2026, 1, 14), "周一、周二、周三各一天");
         // 起点在周末时顺延到周一。
         assert_eq!(
-            add_workdays(days_from_civil(2026, 1, 10), 1),
+            add_workdays(days_from_civil(2026, 1, 10), 1, &c),
             days_from_civil(2026, 1, 13)
         );
     }
 
     #[test]
     fn weekend_spans_merge_consecutive_days() {
+        let c = parse(SAMPLE).unwrap();
         let monday = days_from_civil(2026, 1, 5);
-        let spans = weekend_spans(monday, monday + 13);
+        let spans = excluded_spans(monday, monday + 13, &c);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].1 - spans[0].0, 2);
         assert_eq!(spans[1].1 - spans[1].0, 2);
+    }
+
+    /// `excludes` 列出的具体日期同样不计工时、占日历宽度，并画淡色带。
+    #[test]
+    fn excludes_specific_dates_skip_workdays() {
+        let src = "gantt\n dateFormat YYYY-MM-DD\n excludes 2026-01-06, 2026-01-07\n section S\n 任务 : t1, 2026-01-05, 3d\n";
+        let c = parse(src).unwrap();
+        assert!(!c.exclude_weekends);
+        assert_eq!(c.excluded_dates.len(), 2);
+        let ranges = resolve_ranges(&c);
+        // 1/5 起 3 个工作日：1/5、1/8、1/9（跳过 1/6、1/7），结束于 1/10。
+        assert_eq!(ranges[0].0, days_from_civil(2026, 1, 5));
+        assert_eq!(ranges[0].1, days_from_civil(2026, 1, 10));
+        let l = layout(&c);
+        assert!(!l.weekends.is_empty(), "excludes 日期应产生淡色带");
     }
 
     #[test]
@@ -1203,5 +1274,60 @@ mod tests {
     #[test]
     fn empty_chart_is_rejected() {
         assert!(parse("gantt\n title 空计划\n").is_none());
+    }
+
+    /// `excludes weekends` 与具体节假日叠加：两者都不计工时。
+    #[test]
+    fn excludes_combines_weekends_and_holidays() {
+        let src = "gantt\n dateFormat YYYY-MM-DD\n excludes weekends\n excludes 2026-01-07\n section S\n 任务 : t1, 2026-01-05, 4d\n";
+        let c = parse(src).unwrap();
+        assert!(c.exclude_weekends);
+        assert_eq!(c.excluded_dates.len(), 1);
+        // 1/5(一) 起 4 个工作日：1/6、1/8、1/9、1/12（跳过 1/7 节假日与周末）。
+        let end = add_workdays(days_from_civil(2026, 1, 5), 4, &c);
+        assert_eq!(end, days_from_civil(2026, 1, 12));
+        let ranges = resolve_ranges(&c);
+        assert_eq!(ranges[0].1, days_from_civil(2026, 1, 12));
+    }
+
+    /// 多行 `excludes` 累加具体日期。
+    #[test]
+    fn multiple_excludes_lines_accumulate() {
+        let src = "gantt\n dateFormat YYYY-MM-DD\n excludes 2026-01-06\n excludes 2026-01-07, 2026-01-08\n section S\n 任务 : t1, 2026-01-05, 1d\n";
+        let c = parse(src).unwrap();
+        assert_eq!(c.excluded_dates.len(), 3);
+        assert!(!c.exclude_weekends);
+        // 1/5 起 1 个工作日：跳过 1/6、1/7、1/8，落到 1/9。
+        let end = add_workdays(days_from_civil(2026, 1, 5), 1, &c);
+        assert_eq!(end, days_from_civil(2026, 1, 9));
+    }
+
+    /// 起点落在周末时顺延到下一个工作日再数工时。
+    #[test]
+    fn start_on_excluded_day_defers_to_workday() {
+        let src = "gantt\n dateFormat YYYY-MM-DD\n excludes weekends\n section S\n 任务 : t1, 2026-01-10, 1d\n";
+        let c = parse(src).unwrap();
+        // 1/10 是周六：顺延到周一 1/12，再数 1 个工作日到 1/13。
+        let end = add_workdays(days_from_civil(2026, 1, 10), 1, &c);
+        assert_eq!(end, days_from_civil(2026, 1, 13));
+        let ranges = resolve_ranges(&c);
+        assert_eq!(ranges[0].0, days_from_civil(2026, 1, 10), "起始日仍按书写值");
+        assert_eq!(ranges[0].1, days_from_civil(2026, 1, 13));
+    }
+
+    /// 与周末相邻的节假日合并成一段淡色带，而不是各画一条。
+    #[test]
+    fn excluded_spans_merge_holiday_adjacent_to_weekend() {
+        let src = "gantt\n dateFormat YYYY-MM-DD\n excludes weekends\n excludes 2026-01-12\n section S\n 任务 : t1, 2026-01-05, 1d\n";
+        let c = parse(src).unwrap();
+        let monday = days_from_civil(2026, 1, 5);
+        let spans = excluded_spans(monday, monday + 9, &c);
+        // 1/10(六)、1/11(日)、1/12(一 节假日) 合并成一个 3 天区间。
+        let merged = spans
+            .iter()
+            .find(|&&(s, _)| s == days_from_civil(2026, 1, 10))
+            .expect("应有从周六起的淡色带");
+        assert_eq!(merged.1 - merged.0, 3, "周末 + 相邻节假日应合并成 3 天");
+        assert_eq!(merged.1, days_from_civil(2026, 1, 13));
     }
 }

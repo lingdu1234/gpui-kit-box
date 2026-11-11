@@ -56,6 +56,8 @@ const NOTE_GAP: f32 = 18.;
 /// 首层上方留白：既放注记框，也放「层上方」这条备用布线带。
 const TOP_EXTRA: f32 = 60.;
 const BOTTOM_EXTRA: f32 = 44.;
+/// 自关系（`A --> A`）小回环探出框外的距离。
+const SELF_LOOP: f32 = 40.;
 
 /// 可见度参数：旧版 `border_1()` + 1px 分隔线 + 1.2px 关系线在深色主题下
 /// 基本消失。这里统一加粗，并让所有线条共用同一个强调色。
@@ -351,7 +353,15 @@ pub(super) fn parse(source: &str) -> Option<ClassDiagram> {
             };
             continue;
         }
-        if lower.starts_with("style ") || lower.starts_with("click ") || lower == "end" {
+        if lower.starts_with("style ")
+            || lower.starts_with("click ")
+            || lower.starts_with("classdef ")
+            || lower.starts_with("cssclass ")
+            || lower.starts_with("callback ")
+            || lower.starts_with("link ")
+            || lower.starts_with("tooltip ")
+            || lower == "end"
+        {
             continue;
         }
 
@@ -433,7 +443,7 @@ pub(super) fn parse(source: &str) -> Option<ClassDiagram> {
             let (b_id, b_mult) = split_side(b_part);
             let a = ensure(&mut classes, &mut index, &a_id);
             let b = ensure(&mut classes, &mut index, &b_id);
-            if a != usize::MAX && b != usize::MAX && a != b {
+            if a != usize::MAX && b != usize::MAX {
                 relations.push(Relation {
                     a,
                     b,
@@ -626,6 +636,10 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
     for _ in 0..n {
         let mut changed = false;
         for r in &diagram.relations {
+            // 自关系不参与分层：否则 rank[a] < rank[a]+1 恒真，会把自己一路顶到最深层。
+            if r.a == r.b {
+                continue;
+            }
             if rank[r.b] < rank[r.a] + 1 {
                 rank[r.b] = rank[r.a] + 1;
                 changed = true;
@@ -736,6 +750,9 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
     // 同一个类上的多个端点沿框宽/框高均分，避免几条线叠在一起。
     let mut counts = vec![0usize; n];
     for r in &diagram.relations {
+        if r.a == r.b {
+            continue; // 自关系单独画回环，不占普通端点名额
+        }
         counts[r.a] += 1;
         counts[r.b] += 1;
     }
@@ -743,6 +760,9 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
     let mut used_b = vec![0usize; n];
     let mut slots = vec![((0usize, 0usize), (0usize, 0usize)); diagram.relations.len()];
     for (ei, r) in diagram.relations.iter().enumerate() {
+        if r.a == r.b {
+            continue;
+        }
         slots[ei].0 = (used_a[r.a], counts[r.a]);
         used_a[r.a] += 1;
         slots[ei].1 = (used_b[r.b], counts[r.b]);
@@ -754,10 +774,55 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
     let mut labels = Vec::new();
     let mut mults = Vec::new();
     let mut used_lanes: Vec<f32> = Vec::new();
+    // 自关系回环探出框外，画布尺寸要随之放宽。
+    let mut loop_right = 0f32;
+    let mut loop_bottom = 0f32;
 
     for (ei, r) in diagram.relations.iter().enumerate() {
         let ra = rects[r.a];
         let rb = rects[r.b];
+
+        // 自关系：在框的一侧画一个小回环，不走层间布线带。
+        if r.a == r.b {
+            let points = if vertical {
+                let x = ra.x + ra.w;
+                let (y1, y2) = (ra.y + ra.h * 0.35, ra.y + ra.h * 0.65);
+                loop_right = loop_right.max(x + SELF_LOOP);
+                vec![(x, y1), (x + SELF_LOOP, y1), (x + SELF_LOOP, y2), (x, y2)]
+            } else {
+                let y = ra.y + ra.h;
+                let (x1, x2) = (ra.x + ra.w * 0.35, ra.x + ra.w * 0.65);
+                loop_bottom = loop_bottom.max(y + SELF_LOOP);
+                vec![(x1, y), (x1, y + SELF_LOOP), (x2, y + SELF_LOOP), (x2, y)]
+            };
+            let mut markers = Vec::new();
+            if r.kind.directed() {
+                let last = points.len() - 1;
+                let (tip, from) = if r.reverse {
+                    (points[0], points[1])
+                } else {
+                    (points[last], points[last - 1])
+                };
+                let (kind, filled) = match r.kind {
+                    RelKind::Inherit | RelKind::Realize => (MarkerKind::Triangle, false),
+                    RelKind::Compose => (MarkerKind::Diamond, true),
+                    RelKind::Aggregate => (MarkerKind::Diamond, false),
+                    _ => (MarkerKind::Open, true),
+                };
+                markers.push(Marker { tip, dir: unit(from, tip), kind, filled });
+            }
+            if let Some(text) = &r.label {
+                let mid = if vertical {
+                    (ra.x + ra.w + SELF_LOOP, ra.y + ra.h / 2.)
+                } else {
+                    (ra.x + ra.w / 2., ra.y + ra.h + SELF_LOOP)
+                };
+                labels.push((mid.0, mid.1, text.clone(), ei));
+            }
+            edges.push(EdgeDraw { a: r.a, b: r.b, points, dashed: r.kind.dashed(), markers });
+            continue;
+        }
+
         let (fa, fb) = (frac(slots[ei].0), frac(slots[ei].1));
         let same = rank[r.a] == rank[r.b];
         let (s, e) = if vertical {
@@ -904,6 +969,10 @@ fn layout(diagram: &ClassDiagram) -> ClassLayout {
             markers,
         });
     }
+
+    // 自关系回环可能探出最右 / 最下的框，画布跟着放宽，免得回环被裁掉。
+    width = width.max(loop_right + PAD);
+    height = height.max(loop_bottom + PAD);
 
     // 注记框最后定位：此时关系折线已经算好，注记要同时避开类框、关系线与
     // 别的注记。顺序不能反过来——旧实现先放注记再布线，LR 图里注记正好压在
@@ -1397,6 +1466,41 @@ mod tests {
         assert_eq!(note.owner, Some(duck));
     }
 
+    /// 自关系 `A --> A` 要保留并画成回环，不能像旧实现那样直接丢掉，
+    /// 也不能把自己一路顶到最深层。
+    #[test]
+    fn self_relation_is_kept_and_drawn_as_a_loop() {
+        let d = parse("classDiagram\n class A\n A --> A : 自环\n A --> B\n").unwrap();
+        assert_eq!(d.relations.len(), 2, "自关系不应被丢弃");
+        assert!(d.relations.iter().any(|r| r.a == r.b));
+        let l = layout(&d);
+        let a = d.classes.iter().position(|c| c.name == "A").unwrap();
+        let self_edge = l.edges.iter().find(|e| e.a == a && e.b == a).unwrap();
+        assert!(self_edge.points.len() >= 4, "回环至少四个折点");
+        // 回环探出框外，但仍在画布内。
+        for p in &self_edge.points {
+            assert!(p.0 >= -0.5 && p.0 <= l.width + 0.5);
+            assert!(p.1 >= -0.5 && p.1 <= l.height + 0.5);
+        }
+    }
+
+    /// `classDef` / `cssClass` 等样式指令含冒号，旧实现会把它们误解析成
+    /// 一个叫「classDef X fill」的类。现在应直接跳过。
+    #[test]
+    fn styling_directives_are_not_parsed_as_classes() {
+        let d = parse(
+            "classDiagram\n class A\n classDef highlight fill:#f9f,stroke:#333\n cssClass A highlight\n A --> B\n",
+        )
+        .unwrap();
+        let names: Vec<_> = d.classes.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"A") && names.contains(&"B"));
+        assert!(
+            !names.iter().any(|n| n.contains("classDef") || n.contains("fill")),
+            "样式指令不能被当成类：{names:?}"
+        );
+        assert_eq!(d.classes.len(), 2);
+    }
+
     #[test]
     fn layout_keeps_boxes_inside() {
         let d = parse(SAMPLE).unwrap();
@@ -1512,11 +1616,11 @@ mod tests {
         }
     }
 
-    /// 展示页的四张类图（含 LR 三层架构、泛型、聚合）都要能排布且不穿框。
+    /// 展示页的五张类图（含 LR 三层架构、泛型、聚合）都要能排布且不穿框。
     #[test]
     fn all_showcase_class_diagrams_route_cleanly() {
         let blocks = super::super::showcase_blocks("class");
-        assert_eq!(blocks.len(), 4, "展示页类图数量变了，需要重新确认夹具");
+        assert_eq!(blocks.len(), 5, "展示页类图数量变了，需要重新确认夹具");
         for (bi, block) in blocks.iter().enumerate() {
             let d = parse(block).unwrap_or_else(|| panic!("第 {bi} 张类图无法解析"));
             let l = layout(&d);
@@ -1654,5 +1758,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 自关系回环方向随排布方向：TB 探向框右侧，LR 探向框下方，画布都容得下。
+    #[test]
+    fn self_loop_orientation_follows_direction() {
+        let tb = parse("classDiagram\n direction TB\n class A\n A --> A\n").unwrap();
+        let l = layout(&tb);
+        let a = tb.classes.iter().position(|c| c.name == "A").unwrap();
+        let e = l.edges.iter().find(|e| e.a == a && e.b == a).unwrap();
+        let r = l.rects[a];
+        assert!(e.points.iter().any(|p| p.0 > r.x + r.w), "TB 回环应探向右侧");
+
+        let lr = parse("classDiagram\n direction LR\n class A\n A --> A\n").unwrap();
+        let l = layout(&lr);
+        let a = lr.classes.iter().position(|c| c.name == "A").unwrap();
+        let ei = l.edges.iter().position(|e| e.a == a && e.b == a).unwrap();
+        let e = &l.edges[ei];
+        let r = l.rects[a];
+        assert!(e.points.iter().any(|p| p.1 > r.y + r.h), "LR 回环应探向下方");
+        for p in &e.points {
+            assert!(p.0 <= l.width + 0.5 && p.1 <= l.height + 0.5, "回环探出画布");
+        }
+    }
+
+    /// 有向自关系保留箭头标记，标签落在回环上。
+    #[test]
+    fn self_loop_keeps_marker_and_label() {
+        let d = parse("classDiagram\n class A\n A --|> A : 自继承\n").unwrap();
+        let l = layout(&d);
+        let a = d.classes.iter().position(|c| c.name == "A").unwrap();
+        let ei = l.edges.iter().position(|e| e.a == a && e.b == a).unwrap();
+        let e = &l.edges[ei];
+        assert!(!e.markers.is_empty(), "有向自关系应带箭头标记");
+        assert!(e.markers.iter().any(|m| m.kind == MarkerKind::Triangle));
+        assert!(
+            l.labels.iter().any(|(_, _, text, idx)| text == "自继承" && *idx == ei),
+            "自关系标签应落在回环上"
+        );
+    }
+
+    /// 全部样式指令（classDef/cssClass/callback/link/tooltip/style/click）都跳过，
+    /// 不会误解析成类。
+    #[test]
+    fn all_styling_directives_are_skipped() {
+        let d = parse(
+            "classDiagram\n class A\n class B\n classDef hl fill:#f9f\n cssClass A hl\n callback A \"url\"\n link A \"url\"\n tooltip A \"提示\"\n style A fill:#f00\n click A \"url\"\n A --> B\n",
+        )
+        .unwrap();
+        let names: Vec<_> = d.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"], "样式指令都不能变成类");
+        assert_eq!(d.relations.len(), 1);
+    }
+
+    /// 自关系不参与分层：加不加自环，其它类的分层位置完全不变。
+    #[test]
+    fn self_relation_does_not_deepen_rank() {
+        let with = parse("classDiagram\n class A\n class B\n A --> A\n A --> B\n").unwrap();
+        let without = parse("classDiagram\n class A\n class B\n A --> B\n").unwrap();
+        let lw = layout(&with);
+        let lo = layout(&without);
+        let b = with.classes.iter().position(|c| c.name == "B").unwrap();
+        assert_eq!(lw.rects[b].y, lo.rects[b].y, "自环不应改变 B 的层");
+        assert_eq!(lw.rects[b].x, lo.rects[b].x, "自环不应改变 B 的横向位置");
     }
 }

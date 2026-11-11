@@ -46,6 +46,7 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
     // 正在解析的子图栈：块里的节点要同时记进本层和所有祖先子图的成员。
     let mut sg_stack: Vec<usize> = Vec::new();
     let mut decl_ix = 0usize;
+    let mut direction = Direction::Td;
 
     for raw in source.lines() {
         let line = raw.trim();
@@ -53,14 +54,25 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("flowchart")
-            || lower.starts_with("graph")
-            || lower.starts_with("style")
+        // 首行 `flowchart TD` / `graph LR`：取关键字后的方向 token。
+        if lower.starts_with("flowchart") || lower.starts_with("graph") {
+            let rest = if lower.starts_with("flowchart") { &line[9..] } else { &line[5..] };
+            if let Some(tok) = rest.split_whitespace().next() {
+                direction = Direction::parse(tok);
+            }
+            continue;
+        }
+        // 独立的 `direction LR` 语句同样改排布方向。
+        if lower.starts_with("direction") {
+            if let Some(tok) = line[9..].split_whitespace().next() {
+                direction = Direction::parse(tok);
+            }
+            continue;
+        }
+        if lower.starts_with("style")
             || lower.starts_with("class")
             || lower.starts_with("linkstyle")
             || lower.starts_with("click")
-            // 只支持自上而下：块内的 `direction LR` 解析但不改排布。
-            || lower.starts_with("direction")
         {
             continue;
         }
@@ -99,6 +111,7 @@ pub(super) fn parse_graph(source: &str) -> Option<Graph> {
         overlays,
         pin_edges: Vec::new(),
         notes: Vec::new(),
+        direction,
     })
 }
 
@@ -138,10 +151,10 @@ fn parse_statement(
 ) {
     let mut chunks: Vec<String> = Vec::new();
     let mut labels: Vec<Option<String>> = Vec::new();
-    let mut styles: Vec<(EdgeStyle, EdgeEnd, EdgeEnd)> = Vec::new();
+    let mut styles: Vec<(EdgeStyle, EdgeEnd, EdgeEnd, bool)> = Vec::new();
     let mut rest = statement;
 
-    while let Some((at, len, style, l_end, r_end)) = parse_link(rest) {
+    while let Some((at, len, style, l_end, r_end, invisible)) = parse_link(rest) {
         let head = rest[..at].trim();
         let mut tail = &rest[at + len..];
         // `B -- 已激活 --> C`：标签写在箭头**前**，要从节点文本里切掉。
@@ -156,7 +169,7 @@ fn parse_statement(
         }
         chunks.push(head);
         labels.push(label);
-        styles.push((style, l_end, r_end));
+        styles.push((style, l_end, r_end, invisible));
         rest = tail;
     }
     chunks.push(rest.trim().to_string());
@@ -195,10 +208,11 @@ fn parse_statement(
             continue;
         }
         if !previous.is_empty() {
-            let (style, l_end, r_end) = styles.get(ix - 1).copied().unwrap_or((
+            let (style, l_end, r_end, invisible) = styles.get(ix - 1).copied().unwrap_or((
                 EdgeStyle::Solid,
                 EdgeEnd::Bare,
                 EdgeEnd::Arrow,
+                false,
             ));
             for from in &previous {
                 for to in &currents {
@@ -209,6 +223,7 @@ fn parse_statement(
                         style,
                         l_end,
                         r_end,
+                        invisible,
                     ));
                 }
             }
@@ -232,6 +247,7 @@ fn make_edge(
     style: EdgeStyle,
     left: EdgeEnd,
     right: EdgeEnd,
+    invisible: bool,
 ) -> GraphEdge {
     let (from, from_sg) = match from {
         Endpoint::Node(ix) => (*ix, None),
@@ -251,6 +267,7 @@ fn make_edge(
         right,
         from_sg,
         to_sg,
+        invisible,
     }
 }
 
@@ -278,12 +295,12 @@ fn split_amp(chunk: &str) -> Vec<String> {
 }
 
 /// 结构化解析连线记号 `[左端][线身][右端]`，返回
-/// `(起始字节, 长度, 样式, 左端, 右端)`，`at` 指向左端字符（没有左端时指向线首）。
+/// `(起始字节, 长度, 样式, 左端, 右端, 隐形)`，`at` 指向左端字符（没有左端时指向线首）。
 ///
-/// 线身是连续的 `-` / `.` / `=`（含 `.` 为虚线、含 `=` 为粗线）；左端是 `o` / `x`
-/// / `<`，右端是 `>` / `o` / `x`。实线的裸线身要三段以上（`---`）才算连线——
-/// 两段的 `--` 是「`-- 文字 -->`」这种前标签的分隔符，不能吞掉。
-fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd)> {
+/// 线身是连续的 `-` / `.` / `=` / `~`（含 `.` 为虚线、含 `=` 为粗线、含 `~` 为隐形）；
+/// 左端是 `o` / `x` / `<`，右端是 `>` / `o` / `x`。实线的裸线身要三段以上（`---`）才算
+/// 连线——两段的 `--` 是「`-- 文字 -->`」这种前标签的分隔符，不能吞掉。
+fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd, bool)> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     for k in 0..chars.len() {
         let (at, ch) = chars[k];
@@ -303,12 +320,13 @@ fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd)>
             }
             _ => EdgeEnd::Bare,
         };
-        let (mut dotted, mut thick, mut body) = (false, false, 0usize);
+        let (mut dotted, mut thick, mut invisible, mut body) = (false, false, false, 0usize);
         while let Some(&(_, c)) = chars.get(i) {
             match c {
                 '-' => {}
                 '.' => dotted = true,
                 '=' => thick = true,
+                '~' => invisible = true,
                 _ => break,
             }
             body += 1;
@@ -320,7 +338,7 @@ fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd)>
             Some(&(_, 'x')) => (EdgeEnd::Cross, true),
             _ => (EdgeEnd::Bare, false),
         };
-        // 统一规则：裸线身要三段以上（`---` / `-.-` / `===`）才算连线；
+        // 统一规则：裸线身要三段以上（`---` / `-.-` / `===` / `~~~`）才算连线；
         // 两段的 `--` / `-.` / `==` 是「`-- 文字 -->`」这类前标签的分隔符，
         // 只有紧跟右端符号（`-->` / `-.->` / `==>`）时才按两段算。
         let ok = body >= 3 || (body >= 2 && had_end);
@@ -336,7 +354,7 @@ fn parse_link(text: &str) -> Option<(usize, usize, EdgeStyle, EdgeEnd, EdgeEnd)>
             } else {
                 EdgeStyle::Solid
             };
-            return Some((at, end_at - at, style, left, right));
+            return Some((at, end_at - at, style, left, right, invisible));
         }
     }
     None
@@ -469,7 +487,7 @@ mod tests {
     /// 使用手册里的 5 张图：插件必须能吃下的真实样本。
     const GUIDE: &str = include_str!("../../showcase/diagrams.md");
 
-    /// 展示页里的 3 张流程图（含三段回边的「发布流水线」），
+    /// 展示页里的 7 张流程图（含三段回边的「发布流水线」），
     /// 和应用侧流程图页是同一份 `showcase/flowchart.md`。
     fn showcase_blocks() -> Vec<String> {
         super::super::showcase_blocks("flowchart")
@@ -1139,5 +1157,258 @@ mod tests {
         }
         assert_eq!(graph.edges[2].style, EdgeStyle::Dotted);
         assert_eq!(graph.edges[3].style, EdgeStyle::Thick);
+    }
+
+    #[test]
+    fn parses_direction_from_header_and_statement() {
+        for (src, want) in [
+            ("flowchart TD\nA-->B", Direction::Td),
+            ("flowchart TB\nA-->B", Direction::Td),
+            ("graph LR\nA-->B", Direction::Lr),
+            ("flowchart RL\nA-->B", Direction::Rl),
+            ("flowchart BT\nA-->B", Direction::Bt),
+            ("flowchart TD\nA-->B\ndirection LR", Direction::Lr),
+        ] {
+            let g = parse_graph(src).expect("应可解析");
+            assert_eq!(g.direction, want, "{src}");
+        }
+    }
+
+    #[test]
+    fn invisible_links_rank_but_are_flagged() {
+        let g = parse_graph("flowchart TD\nA ~~~ B\n").expect("应可解析");
+        assert_eq!(g.edges.len(), 1);
+        assert!(g.edges[0].invisible, "`~~~` 应是隐形连线");
+        let l = layout(&g);
+        assert!(l.ranks[1] > l.ranks[0], "隐形连线仍要把 B 排在 A 之后");
+        // 普通连线不带隐形标记。
+        let g2 = parse_graph("flowchart TD\nA --> B\n").unwrap();
+        assert!(!g2.edges[0].invisible);
+    }
+
+    #[test]
+    fn bt_layout_is_exact_vertical_mirror() {
+        let g = parse_graph(
+            "flowchart TD\nA[甲]-->B{乙}\nB-->C[丙]\nB-->D[丁]\nC-->E\nD-->E",
+        )
+        .unwrap();
+        let td = layout(&g);
+        let mut gb = g.clone();
+        gb.direction = Direction::Bt;
+        let bt = layout(&gb);
+        assert_eq!(td.width, bt.width);
+        assert_eq!(td.height, bt.height);
+        let h = td.height;
+        for (a, b) in td.nodes.iter().zip(&bt.nodes) {
+            assert_eq!(a.x, b.x);
+            assert_eq!(a.w, b.w);
+            assert!((b.y - (h - a.y - NODE_H)).abs() < 1e-3);
+        }
+        for (da, db) in td.diamonds.iter().zip(&bt.diamonds) {
+            assert_eq!(da.cx, db.cx);
+            assert!((db.cy - (h - da.cy)).abs() < 1e-3);
+        }
+        for (a, b) in td.overlays.iter().zip(&bt.overlays) {
+            assert!((b.1 - (h - a.3)).abs() < 1e-3);
+            assert!((b.3 - (h - a.1)).abs() < 1e-3);
+        }
+        for (ea, eb) in td.edges.iter().zip(&bt.edges) {
+            let (pa, pb) = (ea.path.points(), eb.path.points());
+            assert_eq!(pa.len(), pb.len());
+            for ((x, y), (x2, y2)) in pa.iter().zip(&pb) {
+                assert!((x - x2).abs() < 1e-3);
+                assert!((y2 - (h - y)).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// 方框两两不重叠（按节点框，不含菱形外扩），供方向变换回归共用。
+    fn assert_no_box_overlap(l: &Layout) {
+        for (i, a) in l.nodes.iter().enumerate() {
+            for b in &l.nodes[i + 1..] {
+                let ox = a.x < b.x + b.w && b.x < a.x + a.w;
+                let oy = a.y < b.y + NODE_H && b.y < a.y + NODE_H;
+                assert!(!(ox && oy), "节点方框重叠了");
+            }
+        }
+    }
+
+    #[test]
+    fn lr_and_rl_layouts_stay_inside_canvas() {
+        let src = "flowchart TD\nA[入口]-->B{判断}\nB-->C[左]\nB-->D[右]\nC-->E[汇合]\nD-->E\nE-->A";
+        for dir in [Direction::Lr, Direction::Rl] {
+            let mut g = parse_graph(src).unwrap();
+            g.direction = dir;
+            let l = layout(&g);
+            assert!(l.width > 0. && l.height > 0.);
+            for p in &l.nodes {
+                assert!(p.x >= 0. && p.x + p.w <= l.width + 0.5);
+                assert!(p.y >= 0. && p.y + NODE_H <= l.height + 0.5);
+            }
+            assert_no_box_overlap(&l);
+            for e in &l.edges {
+                for (x, y) in e.path.points() {
+                    assert!(x >= -0.5 && x <= l.width + 0.5, "{dir:?} 连线探出画布");
+                    assert!(y >= -0.5 && y <= l.height + 0.5, "{dir:?} 连线探出画布");
+                }
+            }
+            // 正向边沿排布方向推进：LR 向右、RL 向左。
+            let cx = |i: usize| l.nodes[i].x + l.nodes[i].w / 2.;
+            for e in &g.edges {
+                if e.is_frame() || l.ranks[e.to] <= l.ranks[e.from] {
+                    continue;
+                }
+                if dir == Direction::Lr {
+                    assert!(cx(e.to) > cx(e.from), "LR 正向边应向右");
+                } else {
+                    assert!(cx(e.to) < cx(e.from), "RL 正向边应向左");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn showcase_flowcharts_reorient_without_overlap() {
+        for block in showcase_blocks() {
+            let base = parse_graph(&block).expect("展示页流程图应可解析");
+            for dir in [Direction::Lr, Direction::Rl, Direction::Bt] {
+                let mut g = base.clone();
+                g.direction = dir;
+                let l = layout(&g);
+                for p in &l.nodes {
+                    assert!(p.x >= -0.5 && p.x + p.w <= l.width + 0.5, "{dir:?} 节点探出画布");
+                    assert!(p.y >= -0.5 && p.y + NODE_H <= l.height + 0.5, "{dir:?} 节点探出画布");
+                }
+                assert_no_box_overlap(&l);
+            }
+        }
+    }
+
+    #[test]
+    fn lr_natural_size_is_wide_and_short() {
+        // 方向变换在 layout() 内完成，node_link_size 据此报告自然尺寸：
+        // LR 链应横向展开（宽 > 高），供等比适配包装算缩放。
+        let g = parse_graph("flowchart LR\nA[甲]-->B[乙]-->C[丙]").unwrap();
+        let (w, h) = super::super::node_link::node_link_size(&g);
+        assert!(w > h, "LR 链应横向展开：{w} x {h}");
+    }
+
+    #[test]
+    fn lr_fan_out_anchors_are_spread() {
+        let mut g = parse_graph("flowchart TD\nA-->B\nA-->C\nA-->D").unwrap();
+        g.direction = Direction::Lr;
+        let l = layout(&g);
+        // A 的三条出线都从右边出发，锚点纵向错开、不重合。
+        let mut ys: Vec<f32> = l.edges.iter().map(|e| e.path.points()[0].1).collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for w in ys.windows(2) {
+            assert!(w[1] - w[0] > 1., "LR 扇出锚点重合了");
+        }
+    }
+
+    /// RL 是 LR 的精确水平镜像：先共用同一套 LR 重排，再整体水平翻转。
+    /// 节点、菱形、外框、连线路径都应逐点镜像，y 不变。
+    #[test]
+    fn rl_is_exact_horizontal_mirror_of_lr() {
+        let g = parse_graph(
+            "flowchart TD\nA[甲]-->B{乙}\nB-->C[丙]\nB-->D[丁]\nC-->E\nD-->E\nE-->A",
+        )
+        .unwrap();
+        let mut gl = g.clone();
+        gl.direction = Direction::Lr;
+        let lr = layout(&gl);
+        let mut gr = g.clone();
+        gr.direction = Direction::Rl;
+        let rl = layout(&gr);
+        assert_eq!(lr.width, rl.width);
+        assert_eq!(lr.height, rl.height);
+        let w = lr.width;
+        for (a, b) in lr.nodes.iter().zip(&rl.nodes) {
+            assert_eq!(a.y, b.y);
+            assert_eq!(a.w, b.w);
+            assert!((b.x - (w - a.x - a.w)).abs() < 1e-3);
+        }
+        for (da, db) in lr.diamonds.iter().zip(&rl.diamonds) {
+            assert_eq!(da.cy, db.cy);
+            assert!((db.cx - (w - da.cx)).abs() < 1e-3);
+        }
+        for (a, b) in lr.overlays.iter().zip(&rl.overlays) {
+            assert!((b.0 - (w - a.2)).abs() < 1e-3);
+            assert!((b.2 - (w - a.0)).abs() < 1e-3);
+        }
+        for (ea, eb) in lr.edges.iter().zip(&rl.edges) {
+            let (pa, pb) = (ea.path.points(), eb.path.points());
+            assert_eq!(pa.len(), pb.len());
+            for ((x, y), (x2, y2)) in pa.iter().zip(&pb) {
+                assert!((y - y2).abs() < 1e-3);
+                assert!((x2 - (w - x)).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// BT 链自下而上：起点在最底、终点在最顶，单链横向居中成一行。
+    #[test]
+    fn bt_chain_reverses_visual_order() {
+        let g = parse_graph("flowchart BT\nA[甲]-->B[乙]-->C[丙]").unwrap();
+        let l = layout(&g);
+        assert!(l.nodes[0].y > l.nodes[1].y, "BT 起点应在下方");
+        assert!(l.nodes[1].y > l.nodes[2].y, "BT 终点应在上方");
+        assert!(
+            (l.nodes[0].x - l.nodes[2].x).abs() < 1.0,
+            "单链应横向居中对齐"
+        );
+    }
+
+    /// 隐形连线与可见连线 / 标签混用：`~~~` 与 `~~~~` 都隐形，仍参与分层，
+    /// 但不带标签；可见边的标签照常保留。
+    #[test]
+    fn invisible_links_combine_with_visible_and_labels() {
+        let g = parse_graph("flowchart TD\nA ~~~ B\nB --> C\nA -->|x| D\nA ~~~~ E\n").unwrap();
+        assert_eq!(g.edges.len(), 4);
+        assert_eq!(
+            g.edges.iter().filter(|e| e.invisible).count(),
+            2,
+            "~~~ 与 ~~~~ 都是隐形连线"
+        );
+        let l = layout(&g);
+        let rank = |label: &str| {
+            let ix = g.nodes.iter().position(|n| n.label == label).unwrap();
+            l.ranks[ix]
+        };
+        assert!(rank("B") > rank("A"));
+        assert!(rank("E") > rank("A"));
+        assert!(rank("C") > rank("B"));
+        assert!(rank("D") > rank("A"));
+        assert!(g.edges.iter().any(|e| !e.invisible && e.label.as_deref() == Some("x")));
+        assert!(g.edges.iter().filter(|e| e.invisible).all(|e| e.label.is_none()));
+    }
+
+    /// 方向变换 + 子图：节点不越界、不重叠，外框在画布内且包住全部成员。
+    #[test]
+    fn direction_with_subgraph_stays_inside() {
+        let src = "flowchart TD\nA[入口]-->B\nsubgraph 盒 [处理]\nB-->C\nC-->D\nend\nD-->E[出口]\nA-->盒";
+        let base = parse_graph(src).unwrap();
+        for dir in [Direction::Lr, Direction::Rl, Direction::Bt] {
+            let mut g = base.clone();
+            g.direction = dir;
+            let l = layout(&g);
+            for p in &l.nodes {
+                assert!(p.x >= -0.5 && p.x + p.w <= l.width + 0.5, "{dir:?} 节点探出画布");
+                assert!(p.y >= -0.5 && p.y + NODE_H <= l.height + 0.5, "{dir:?} 节点探出画布");
+            }
+            assert_no_box_overlap(&l);
+            for (oi, ov) in g.overlays.iter().enumerate() {
+                let (x1, y1, x2, y2, _) = l.overlays[oi];
+                assert!(
+                    x1 >= -0.5 && y1 >= -0.5 && x2 <= l.width + 0.5 && y2 <= l.height + 0.5,
+                    "{dir:?} 外框探出画布"
+                );
+                for &m in &ov.members {
+                    let p = l.nodes[m];
+                    assert!(p.x >= x1 - 0.5 && p.x + p.w <= x2 + 0.5, "{dir:?} 成员挤出外框");
+                    assert!(p.y >= y1 - 0.5 && p.y + NODE_H <= y2 + 0.5, "{dir:?} 成员挤出外框");
+                }
+            }
+        }
     }
 }

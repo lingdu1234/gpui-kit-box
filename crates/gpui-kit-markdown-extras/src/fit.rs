@@ -1,12 +1,12 @@
-//! 等比适配包装：宿主可用空间不足时，把整张图按同一比例缩小。
+//! 等比适配包装：宿主可用空间不足时，把整张图（或整块公式）按同一比例缩小。
 //!
 //! Markdown 宿主把插件元素原样嵌进文档流，`render()` 拿不到可用宽高，
-//! 所以由图自己在布局期测量：`request_measured_layout` 的回调能收到父容器
+//! 所以由内容自己在布局期测量：`request_measured_layout` 的回调能收到父容器
 //! 的可用空间，据此算出 `scale = min(1, 可用/自然)`——只缩不放，哪个方向
 //! 有确定约束就参与取 min（文档流纵向可滚动时高度无约束，只按宽缩）。
-//! 回调返回缩放后的尺寸；`prepaint` 再按同一 scale 构建图元素，布局并定位
-//! 到包装的原点。五种图共用这一个包装，空间充足时 scale=1，输出与自然
-//! 尺寸逐像素一致。
+//! 回调返回缩放后的尺寸；`prepaint` 再按同一 scale 构建内容元素，布局并定位
+//! 到包装的原点。五类 Mermaid 图与独立公式块共用这一个包装，空间充足时
+//! scale=1，输出与自然尺寸逐像素一致。
 //!
 //! 缩放只发生在渲染映射层：各渲染器把全部坐标、字号、线宽同乘一个系数，
 //! 布局算法不动，几何天然相似，不会变形。
@@ -33,17 +33,17 @@ fn fit_scale(natural: Size<Pixels>, available: Size<AvailableSpace>) -> f32 {
     scale.clamp(0., 1.)
 }
 
-/// 包在图元素外面的一层「测量 + 等比缩放」壳。
+/// 包在内容元素外面的一层「测量 + 等比缩放」壳。
 ///
 /// `build` 在 `prepaint` 期才调用：那时可用宽高已经确定，按算好的 scale
-/// 构建一次图元素即可（与 `uniform_list` 在 prepaint 渲染子项同一模式）。
-pub(super) struct FitDiagram {
+/// 构建一次内容元素即可（与 `uniform_list` 在 prepaint 渲染子项同一模式）。
+pub(crate) struct FitDiagram {
     natural: Size<Pixels>,
     build: Option<Box<dyn FnOnce(f32, &mut Window, &mut App) -> AnyElement>>,
 }
 
 impl FitDiagram {
-    pub(super) fn new(
+    pub(crate) fn new(
         width: f32,
         height: f32,
         build: impl FnOnce(f32, &mut Window, &mut App) -> AnyElement + 'static,

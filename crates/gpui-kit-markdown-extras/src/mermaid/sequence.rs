@@ -167,27 +167,33 @@ fn ensure(
     ix
 }
 
-/// 找出消息行里最先出现的箭头，返回 `(字节位置, 长度, 类型)`。
-fn find_arrow(line: &str) -> Option<(usize, usize, Arrow)> {
+/// 找出消息行里最先出现的箭头，返回 `(字节位置, 长度, 类型, 是否反向)`。
+/// 反向箭头（`<-` / `<<-` …）箭头朝左：发送方在右、接收方在左，解析时交换两端。
+fn find_arrow(line: &str) -> Option<(usize, usize, Arrow, bool)> {
     // 长箭头排在前面：同一起点时优先匹配 `-->>` 而不是 `-->`。
-    const ARROWS: &[(&str, Arrow)] = &[
-        ("<<-->>", Arrow::Bidi),
-        ("<<->>", Arrow::Bidi),
-        ("-->>", Arrow::DottedFilled),
-        ("->>", Arrow::SolidFilled),
-        ("--x", Arrow::Cross),
-        ("-x", Arrow::Cross),
-        ("--)", Arrow::OpenAsync),
-        ("-)", Arrow::OpenAsync),
-        ("-->", Arrow::Dotted),
-        ("->", Arrow::Solid),
+    // 双向 `<<->>` / `<<-->>` 起点更靠前，会先于反向 `<-` 命中，不会被误判。
+    const ARROWS: &[(&str, Arrow, bool)] = &[
+        ("<<-->>", Arrow::Bidi, false),
+        ("<<->>", Arrow::Bidi, false),
+        ("-->>", Arrow::DottedFilled, false),
+        ("->>", Arrow::SolidFilled, false),
+        ("--x", Arrow::Cross, false),
+        ("-x", Arrow::Cross, false),
+        ("--)", Arrow::OpenAsync, false),
+        ("-)", Arrow::OpenAsync, false),
+        ("-->", Arrow::Dotted, false),
+        ("->", Arrow::Solid, false),
+        ("<<--", Arrow::DottedFilled, true),
+        ("<<-", Arrow::SolidFilled, true),
+        ("<--", Arrow::Dotted, true),
+        ("<-", Arrow::Solid, true),
     ];
-    let mut best: Option<(usize, usize, Arrow)> = None;
-    for &(token, kind) in ARROWS {
+    let mut best: Option<(usize, usize, Arrow, bool)> = None;
+    for &(token, kind, reverse) in ARROWS {
         if let Some(at) = line.find(token)
-            && best.is_none_or(|(pos, _, _)| at < pos)
+            && best.is_none_or(|(pos, _, _, _)| at < pos)
         {
-            best = Some((at, token.len(), kind));
+            best = Some((at, token.len(), kind, reverse));
         }
     }
     best
@@ -223,6 +229,7 @@ pub(super) fn parse(source: &str) -> Option<Sequence> {
     let mut activations: Vec<(usize, usize, usize)> = Vec::new();
     let mut row = 0usize;
     let mut number = 0usize;
+    let mut step = 1usize;
     let mut autonumber = false;
     let mut i = 0usize;
 
@@ -234,13 +241,51 @@ pub(super) fn parse(source: &str) -> Option<Sequence> {
         }
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("sequencediagram")
-            || lower == "autonumber"
             || lower.starts_with("title ")
             || lower.starts_with("link ")
             || lower.starts_with("links ")
             || lower.starts_with("properties ")
         {
-            autonumber |= lower == "autonumber";
+            continue;
+        }
+
+        // `autonumber` / `autonumber 10` / `autonumber 10 5`：起始值与步长。
+        if lower == "autonumber" || lower.starts_with("autonumber ") {
+            let args: Vec<usize> = line["autonumber".len()..]
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            number = args.first().copied().unwrap_or(1);
+            step = args.get(1).copied().unwrap_or(1).max(1);
+            autonumber = true;
+            continue;
+        }
+
+        // `create participant X as Y` / `create actor X`：中途登场的参与者。
+        // 本布局把所有参与者统一排在顶/底，这里只负责登记，不画「中途出现」动画。
+        if lower.starts_with("create ") {
+            let rest = line[7..].trim();
+            let rest_lower = rest.to_ascii_lowercase();
+            let (actor, body) = if rest_lower.starts_with("participant ") {
+                (false, rest[12..].trim())
+            } else if rest_lower.starts_with("actor ") {
+                (true, rest[6..].trim())
+            } else {
+                (false, rest)
+            };
+            let (id, display) = match body.split_once(" as ") {
+                Some((id, display)) => (id.trim(), clean_label(display)),
+                None => (body, clean_label(body)),
+            };
+            let ix = ensure(&mut participants, &mut index, id, actor);
+            participants[ix].label = display;
+            continue;
+        }
+        // `destroy X`：退场的参与者。登记一下保证它仍在图上，不画删除标记。
+        if lower.starts_with("destroy ") {
+            let who = line[8..].trim();
+            let id = who.split_once(" as ").map(|(id, _)| id.trim()).unwrap_or(who);
+            ensure(&mut participants, &mut index, id, false);
             continue;
         }
 
@@ -357,7 +402,7 @@ pub(super) fn parse(source: &str) -> Option<Sequence> {
         }
 
         // ---- 消息 ----
-        let Some((at, len, arrow)) = find_arrow(line) else {
+        let Some((at, len, arrow, reverse)) = find_arrow(line) else {
             continue; // 不认识的行忽略，不吞整张图
         };
         let from_id = line[..at].trim();
@@ -378,11 +423,20 @@ pub(super) fn parse(source: &str) -> Option<Sequence> {
         if from_id.is_empty() || to_id.is_empty() {
             continue;
         }
+        // 反向箭头：右端才是发送方。交换后 from 在右、to 在左，
+        // 渲染层按 x 坐标自然把箭头画成朝左。
+        let (from_id, to_id) = if reverse {
+            (to_id, from_id)
+        } else {
+            (from_id, to_id)
+        };
         let from = ensure(&mut participants, &mut index, from_id, false);
         let to = ensure(&mut participants, &mut index, to_id, false);
-        if autonumber {
-            number += 1;
-        }
+        let msg_number = autonumber.then(|| {
+            let n = number;
+            number += step;
+            n
+        });
         if activate {
             active.entry(to).or_insert(row);
         }
@@ -399,7 +453,7 @@ pub(super) fn parse(source: &str) -> Option<Sequence> {
                 to,
                 text,
                 arrow,
-                number: autonumber.then_some(number),
+                number: msg_number,
             },
             row,
         ));
@@ -1166,6 +1220,82 @@ mod tests {
         assert!(!seq.activations.is_empty(), "+/- 应产生激活区间");
     }
 
+    /// `autonumber 10 5`：从 10 起、每条 +5。旧实现只认裸 `autonumber`。
+    #[test]
+    fn autonumber_honors_start_and_step() {
+        let seq = parse(
+            "sequenceDiagram\n autonumber 10 5\n A->>B: 一\n B->>A: 二\n A->>B: 三\n",
+        )
+        .unwrap();
+        let nums: Vec<_> = seq
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Message(m, _) => m.number,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nums, vec![10, 15, 20]);
+        // 只写起始值：步长默认 1。
+        let seq = parse("sequenceDiagram\n autonumber 3\n A->>B: x\n B->>A: y\n").unwrap();
+        let nums: Vec<_> = seq
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Message(m, _) => m.number,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nums, vec![3, 4]);
+    }
+
+    /// `create participant` / `create actor` / `destroy` 都要登记参与者，
+    /// 不能把整行当未知消息丢掉。
+    #[test]
+    fn create_and_destroy_register_participants() {
+        let seq = parse(
+            "sequenceDiagram\n A->>B: 嗨\n create participant C as 丙\n create actor D\n B->>C: 转\n destroy C\n",
+        )
+        .unwrap();
+        let labels: Vec<_> = seq.participants.iter().map(|p| p.label.as_str()).collect();
+        assert!(labels.contains(&"丙"), "create participant 应登记别名");
+        assert!(labels.contains(&"D"), "create actor 应登记");
+        assert!(seq.participants.iter().any(|p| p.label == "D" && p.actor));
+        // C 的显示名是别名「丙」；destroy 不删除它，参与者总数仍是 A/B/C/D 四个。
+        assert_eq!(seq.participants.len(), 4, "destroy 不应移除参与者");
+        assert_eq!(seq.rows, 2, "create/destroy 不占消息行");
+    }
+
+    /// 反向箭头 `<-` / `<<-`：右端是发送方，箭头朝左。
+    #[test]
+    fn reverse_arrows_swap_sender_and_receiver() {
+        let seq = parse("sequenceDiagram\n participant A\n participant B\n B<-A: 反向\n").unwrap();
+        let msg = seq
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Message(m, _) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        // A 在右（发送方），B 在左（接收方）。
+        assert_eq!(seq.participants[msg.from].label, "A");
+        assert_eq!(seq.participants[msg.to].label, "B");
+        assert!(msg.arrow == Arrow::Solid);
+        // 双向箭头不能被反向 `<-` 误吞。
+        let seq = parse("sequenceDiagram\n A<<->>B: 双向\n").unwrap();
+        let msg = seq
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Message(m, _) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        assert!(msg.arrow == Arrow::Bidi);
+        assert_eq!(seq.participants[msg.from].label, "A");
+    }
+
     #[test]
     fn layout_keeps_everything_inside() {
         let seq = parse(SAMPLE).unwrap();
@@ -1186,13 +1316,13 @@ mod tests {
         }
     }
 
-    /// 展示页的四张时序图都必须让激活框显式闭合。
+    /// 展示页的六张时序图都必须让激活框显式闭合。
     /// 旧示例里的 `B-->>-A` 会让 Mermaid 报 "Trying to inactivate an inactive
     /// participant (B)"：`-` 关闭的是发送方，而 B 从未被 `+` 激活。
     #[test]
     fn all_showcase_activations_are_balanced() {
         let blocks = super::super::showcase_blocks("sequence");
-        assert_eq!(blocks.len(), 4, "展示页时序图数量变了，需要重新确认夹具");
+        assert_eq!(blocks.len(), 6, "展示页时序图数量变了，需要重新确认夹具");
         for (ix, block) in blocks.iter().enumerate() {
             let seq = parse(block).unwrap_or_else(|| panic!("第 {ix} 张时序图无法解析"));
             for &(who, start, end) in &seq.activations {
@@ -1283,7 +1413,7 @@ mod tests {
         assert!(checked >= 4, "展示页应检查到多条守卫，实际 {checked}");
     }
 
-    /// 展示页四张时序图里，任意两块文字都不能叠在一起。
+    /// 展示页六张时序图里，任意两块文字都不能叠在一起。
     ///
     /// 时序图的文字全是绝对定位：消息标签、注释、片段类型标签、守卫、编号圆圈。
     /// 只要布局少算一段间距，两块字就会互相盖住，改起来又很容易顾此失彼——
@@ -1310,7 +1440,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked >= 20, "四张展示图合计只检查到 {checked} 块文字，范围不对");
+        assert!(checked >= 20, "六张展示图合计只检查到 {checked} 块文字，范围不对");
     }
 
     #[test]
@@ -1334,5 +1464,84 @@ mod tests {
     fn unknown_or_disabled_diagrams_are_safe() {
         assert!(parse("sequenceDiagram\n").is_none());
         assert!(parse("sequenceDiagram\n  A->>B: 只有一条\n").is_some());
+    }
+
+    /// 四种反向箭头都交换发送 / 接收方，且各自保留正确的箭头类型。
+    #[test]
+    fn all_reverse_arrow_types_swap_and_keep_kind() {
+        for (token, kind) in [
+            ("<-", Arrow::Solid),
+            ("<<-", Arrow::SolidFilled),
+            ("<--", Arrow::Dotted),
+            ("<<--", Arrow::DottedFilled),
+        ] {
+            let src = format!("sequenceDiagram\n participant A\n participant B\n B{token}A: 反向\n");
+            let seq = parse(&src).unwrap();
+            let msg = seq
+                .events
+                .iter()
+                .find_map(|e| match e {
+                    Event::Message(m, _) => Some(m),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(seq.participants[msg.from].label, "A", "{token} 发送方应在右");
+            assert_eq!(seq.participants[msg.to].label, "B", "{token} 接收方应在左");
+            assert!(msg.arrow == kind, "{token} 箭头类型不对");
+        }
+    }
+
+    /// autonumber 的边界：步长 0 钳到 1、非数字参数退回默认、裸命令从 1 起。
+    #[test]
+    fn autonumber_step_edge_cases() {
+        let nums = |src: &str| -> Vec<usize> {
+            parse(src)
+                .unwrap()
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Message(m, _) => m.number,
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            nums("sequenceDiagram\n autonumber 5 0\n A->>B: x\n B->>A: y\n A->>B: z\n"),
+            vec![5, 6, 7],
+            "步长 0 应钳到 1"
+        );
+        assert_eq!(
+            nums("sequenceDiagram\n autonumber\n A->>B: x\n B->>A: y\n"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            nums("sequenceDiagram\n autonumber abc\n A->>B: x\n B->>A: y\n"),
+            vec![1, 2],
+            "非数字参数应退回默认 1/1"
+        );
+        assert_eq!(
+            nums("sequenceDiagram\n autonumber 2 3\n A->>B: x\n B->>A: y\n A->>B: z\n"),
+            vec![2, 5, 8]
+        );
+        assert_eq!(
+            nums("sequenceDiagram\n A->>B: x\n B->>A: y\n"),
+            Vec::<usize>::new(),
+            "没有 autonumber 就不编号"
+        );
+    }
+
+    /// create/destroy 的登场顺序与别名：destroy 不删除参与者，actor 标记正确。
+    #[test]
+    fn create_destroy_ordering_and_aliases() {
+        let seq = parse(
+            "sequenceDiagram\n A->>B: 一\n create actor C as 丙\n B->>C: 二\n create participant D\n destroy C as 丙\n C->>D: 三\n",
+        )
+        .unwrap();
+        let labels: Vec<_> = seq.participants.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["A", "B", "丙", "D"], "按登场顺序登记");
+        assert!(seq.participants[2].actor, "create actor 应是 actor");
+        assert!(!seq.participants[3].actor, "create participant 不是 actor");
+        assert_eq!(seq.participants.len(), 4, "destroy 不应移除参与者");
+        assert_eq!(seq.rows, 3, "create/destroy 不占消息行");
     }
 }

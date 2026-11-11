@@ -31,7 +31,9 @@
 use std::collections::HashMap;
 
 use super::common::clean_label;
-use super::layout::{EdgeEnd, EdgeStyle, Graph, GraphEdge, GraphNode, Overlay, Shape, mark_back_edges};
+use super::layout::{
+    Direction, EdgeEnd, EdgeStyle, Graph, GraphEdge, GraphNode, Overlay, Shape, mark_back_edges,
+};
 
 /// `[*]` 每次出现都是独立的一个圆（起点与终点不能共用一个节点）。
 /// 其余 id 复用同一个节点，后写的 `<<choice>>` 等声明会覆盖形状。
@@ -104,6 +106,7 @@ fn add_edge(
         right: EdgeEnd::Arrow,
         from_sg: None,
         to_sg: None,
+        invisible: false,
     });
     (from, to)
 }
@@ -135,6 +138,7 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
     let mut overlays: Vec<Overlay> = Vec::new();
     let mut pins: Vec<(usize, usize)> = Vec::new();
     let mut notes: Vec<(usize, String)> = Vec::new();
+    let mut direction = Direction::Td;
     let mut i = 0usize;
 
     while i < lines.len() {
@@ -144,8 +148,14 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
             continue;
         }
         let lower = line.to_ascii_lowercase();
+        // `direction LR` 等：改排布方向（共用布局器按方向做几何变换）。
+        if lower.starts_with("direction ") {
+            if let Some(tok) = line[9..].split_whitespace().next() {
+                direction = Direction::parse(tok);
+            }
+            continue;
+        }
         if lower.starts_with("statediagram")
-            || lower.starts_with("direction ")
             || lower.starts_with("classdef ")
             || lower.starts_with("style ")
             || lower.starts_with("click ")
@@ -172,27 +182,38 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
                 if inner.is_empty() || inner.starts_with("%%") {
                     continue;
                 }
-                let Some((a, b, label)) = parse_transition(inner) else {
+                // 并发区域分隔符 `--`：独立成行时跳过；行内 ` -- ` 把多条链拆开。
+                // 各链都解析进同一个复合状态（近似并排），不丢节点、不 panic。
+                if inner == "--" {
                     continue;
-                };
-                let ka = if a == "[*]" {
-                    a.clone()
-                } else {
-                    format!("{name}::{a}")
-                };
-                let kb = if b == "[*]" {
-                    b.clone()
-                } else {
-                    format!("{name}::{b}")
-                };
-                let (from, to) = add_edge(&mut nodes, &mut index, &mut edges, &ka, &kb, label);
-                if !members.contains(&from) {
-                    members.push(from);
                 }
-                if !members.contains(&to) {
-                    members.push(to);
+                for part in inner.split(" -- ") {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let Some((a, b, label)) = parse_transition(part) else {
+                        continue;
+                    };
+                    let ka = if a == "[*]" {
+                        a.clone()
+                    } else {
+                        format!("{name}::{a}")
+                    };
+                    let kb = if b == "[*]" {
+                        b.clone()
+                    } else {
+                        format!("{name}::{b}")
+                    };
+                    let (from, to) = add_edge(&mut nodes, &mut index, &mut edges, &ka, &kb, label);
+                    if !members.contains(&from) {
+                        members.push(from);
+                    }
+                    if !members.contains(&to) {
+                        members.push(to);
+                    }
+                    inner_pairs.push((from, to));
                 }
-                inner_pairs.push((from, to));
             }
             for &m in members.iter().skip(1) {
                 if !inner_pairs.iter().any(|&(_, t)| t == m) {
@@ -212,6 +233,15 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
             if let Some((display, id)) = rest.split_once(" as ") {
                 let ix = node_ix(&mut nodes, &mut index, id.trim(), "", Shape::Round);
                 nodes[ix].label = clean_label(display);
+                continue;
+            }
+            // `state X: 描述文字`：冒号左边是状态 id，右边作为它的显示文字。
+            if let Some((id, desc)) = rest.split_once(':') {
+                let ix = node_ix(&mut nodes, &mut index, id.trim(), "", Shape::Round);
+                let desc = clean_label(desc);
+                if !desc.is_empty() {
+                    nodes[ix].label = desc;
+                }
                 continue;
             }
             if lower.contains("<<") {
@@ -258,6 +288,7 @@ pub(super) fn parse(source: &str) -> Option<Graph> {
         overlays,
         pin_edges: pins,
         notes,
+        direction,
     })
 }
 
@@ -422,5 +453,129 @@ mod tests {
             }
         }
         assert!(checked > 0, "展示页应至少有一张带复合状态的状态图");
+    }
+
+    #[test]
+    fn colon_description_becomes_display_label() {
+        let g = parse("stateDiagram-v2\nstate X: 描述文字\nX --> Y\n").unwrap();
+        assert!(
+            g.nodes.iter().any(|n| n.label == "描述文字"),
+            "冒号后的描述应成为显示文字"
+        );
+        assert!(
+            !g.nodes.iter().any(|n| n.label.contains("X:")),
+            "不应把整串 `X: 描述` 当成标签"
+        );
+        // 已存在的状态再写描述：覆盖显示文字，不新建节点。
+        let g2 = parse("stateDiagram-v2\nA --> B\nstate B: 完成\n").unwrap();
+        assert_eq!(g2.nodes.iter().filter(|n| n.label == "完成").count(), 1);
+        // `state "desc" as X` 仍照旧。
+        let g3 = parse("stateDiagram-v2\nstate \"别名\" as Z\nZ --> [*]\n").unwrap();
+        assert!(g3.nodes.iter().any(|n| n.label == "别名"));
+    }
+
+    #[test]
+    fn concurrent_regions_keep_both_chains() {
+        let node_h = super::super::layout::NODE_H;
+        // 独立成行的 `--` 分隔符。
+        let src = "stateDiagram-v2\nstate X {\n A --> B\n --\n C --> D\n}\n";
+        let g = parse(src).unwrap();
+        for label in ["X::A", "X::B", "X::C", "X::D"] {
+            assert!(g.nodes.iter().any(|n| n.label == label), "缺少 {label}");
+        }
+        let l = super::super::layout::layout(&g);
+        for p in &l.nodes {
+            assert!(p.x >= 0. && p.x + p.w <= l.width + 0.5);
+            assert!(p.y >= 0. && p.y + node_h <= l.height + 0.5);
+        }
+        // 行内 ` -- ` 分隔同样要解析出两条链。
+        let src2 = "stateDiagram-v2\nstate X {\n A --> B -- C --> D\n}\n";
+        let g2 = parse(src2).unwrap();
+        for label in ["X::A", "X::B", "X::C", "X::D"] {
+            assert!(g2.nodes.iter().any(|n| n.label == label), "行内区域缺少 {label}");
+        }
+    }
+
+    #[test]
+    fn parses_direction() {
+        for (tok, want) in [
+            ("LR", Direction::Lr),
+            ("RL", Direction::Rl),
+            ("BT", Direction::Bt),
+            ("TB", Direction::Td),
+        ] {
+            let src = format!("stateDiagram-v2\ndirection {tok}\n[*] --> A\nA --> [*]\n");
+            let g = parse(&src).unwrap();
+            assert_eq!(g.direction, want, "direction {tok}");
+            // 方向变换后布局不炸、节点都在画布内。
+            let l = super::super::layout::layout(&g);
+            let node_h = super::super::layout::NODE_H;
+            for p in &l.nodes {
+                assert!(p.x >= -0.5 && p.x + p.w <= l.width + 0.5);
+                assert!(p.y >= -0.5 && p.y + node_h <= l.height + 0.5);
+            }
+        }
+    }
+
+    /// 冒号描述 + direction 组合：描述成为显示文字，方向变换后布局不炸。
+    #[test]
+    fn colon_description_combines_with_direction() {
+        let src = "stateDiagram-v2\ndirection LR\nstate Idle: 空闲\nstate Run: 运行\nIdle --> Run : start\nRun --> [*]\n";
+        let g = parse(src).unwrap();
+        assert_eq!(g.direction, Direction::Lr);
+        assert!(g.nodes.iter().any(|n| n.label == "空闲"));
+        assert!(g.nodes.iter().any(|n| n.label == "运行"));
+        let l = super::super::layout::layout(&g);
+        let node_h = super::super::layout::NODE_H;
+        for p in &l.nodes {
+            assert!(p.x >= -0.5 && p.x + p.w <= l.width + 0.5);
+            assert!(p.y >= -0.5 && p.y + node_h <= l.height + 0.5);
+        }
+    }
+
+    /// 并发区域的两条链都钉在复合状态锚点下方，外框包住全部四个成员。
+    #[test]
+    fn concurrent_regions_pin_under_anchor_and_wrap() {
+        let src = "stateDiagram-v2\n[*] --> X\nstate X {\n A --> B\n --\n C --> D\n}\nX --> [*]\n";
+        let g = parse(src).unwrap();
+        let anchor = g.nodes.iter().position(|n| n.label == "X").unwrap();
+        let ov = g.overlays.iter().find(|o| o.anchor == Some(anchor)).unwrap();
+        let inner: Vec<usize> = ov.members.iter().copied().filter(|&m| m != anchor).collect();
+        assert_eq!(inner.len(), 4, "两条并发链共四个内部成员");
+        let l = super::super::layout::layout(&g);
+        for &m in &inner {
+            assert!(l.ranks[m] > l.ranks[anchor], "内部成员应钉在锚点下方");
+        }
+        let node_h = super::super::layout::NODE_H;
+        let (x1, y1, x2, y2, _) = l.overlays[0];
+        for &m in &inner {
+            let p = l.nodes[m];
+            assert!(
+                p.x >= x1 && p.x + p.w <= x2 && p.y >= y1 && p.y + node_h <= y2,
+                "并发成员被挤出外框"
+            );
+        }
+    }
+
+    /// 行内 ` -- ` 分隔的并发区域同样排进外框，不越界。
+    #[test]
+    fn concurrent_inline_regions_wrap_in_frame() {
+        let src = "stateDiagram-v2\n[*] --> X\nstate X {\n A --> B -- C --> D\n}\nX --> [*]\n";
+        let g = parse(src).unwrap();
+        let anchor = g.nodes.iter().position(|n| n.label == "X").unwrap();
+        let ov = g.overlays.iter().find(|o| o.anchor == Some(anchor)).unwrap();
+        let inner: Vec<usize> = ov.members.iter().copied().filter(|&m| m != anchor).collect();
+        assert_eq!(inner.len(), 4);
+        let l = super::super::layout::layout(&g);
+        let node_h = super::super::layout::NODE_H;
+        let (x1, y1, x2, y2, _) = l.overlays[0];
+        for &m in &inner {
+            let p = l.nodes[m];
+            assert!(p.x >= x1 && p.x + p.w <= x2 && p.y >= y1 && p.y + node_h <= y2);
+        }
+        for p in &l.nodes {
+            assert!(p.x >= -0.5 && p.x + p.w <= l.width + 0.5);
+            assert!(p.y >= -0.5 && p.y + node_h <= l.height + 0.5);
+        }
     }
 }

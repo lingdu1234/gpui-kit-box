@@ -65,6 +65,18 @@ mod math;
 ))]
 mod mermaid;
 
+// 等比适配包装：五类 Mermaid 图与独立公式块共用（见 `fit.rs` 顶部说明）。
+// 只要有任何一种需要「空间不足时整体缩小」的内容就编译。
+#[cfg(any(
+    feature = "math",
+    feature = "mermaid-flowchart",
+    feature = "mermaid-sequence",
+    feature = "mermaid-class",
+    feature = "mermaid-state",
+    feature = "mermaid-gantt"
+))]
+mod fit;
+
 use gpui_kit::component::text::TextView;
 
 #[cfg(feature = "math")]
