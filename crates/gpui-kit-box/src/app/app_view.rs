@@ -3,7 +3,8 @@ use crate::app::app_sidebar::AppSidebar;
 use crate::app::app_view_container::PageViewContainer;
 use crate::app::{AppConfigState, app_config_state::get_side_bar_side};
 use crate::app_pages::manual_page::{
-    ClassPage, FlowchartPage, FormulaPage, GanttPage, MarkdownBasicPage, SequencePage, StatePage,
+    ClassPage, DiagramsPage, FlowchartPage, FormulaPage, GanttPage, MarkdownBasicPage, SequencePage,
+    StatePage,
 };
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, h_flex};
@@ -88,6 +89,7 @@ impl AppView {
                 "Mermaid 图表",
                 vec![
                     PageViewContainer::panel::<FlowchartPage>(window, cx),
+                    PageViewContainer::panel::<DiagramsPage>(window, cx),
                     PageViewContainer::panel::<SequencePage>(window, cx),
                     PageViewContainer::panel::<ClassPage>(window, cx),
                     PageViewContainer::panel::<StatePage>(window, cx),

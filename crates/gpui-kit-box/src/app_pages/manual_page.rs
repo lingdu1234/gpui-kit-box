@@ -169,6 +169,16 @@ doc_page!(
 );
 
 doc_page!(
+    DiagramsPage,
+    "流程图样例",
+    "diagrams.md：软件中真实的流程案例",
+    FileStack,
+    "diagrams-doc",
+    showcase_source!("diagrams.md"),
+    flowchart_plugins
+);
+
+doc_page!(
     SequencePage,
     "时序图",
     "sequenceDiagram：消息、激活、注释与组合片段",
